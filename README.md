@@ -25,7 +25,7 @@ Only sessions started with `bin/th-claude` or `/spawn` are connected. Your globa
    - Open the generated URL and add the bot to your server.
 4. In Discord: **User Settings → Advanced → Developer Mode** on. Then right-click your server icon → **Copy Server ID** (`DISCORD_GUILD_ID`), and right-click your own name → **Copy User ID** (`DISCORD_OWNER_ID`).
 
-The bot uses channels named `#fleet`, `#needs-you` and `#agent-chatter`, and creates any that are missing.
+The bot uses channels named `#fleet`, `#needs-you`, `#agent-chatter` and `#thunderhead`, and creates any that are missing. Group channels go in a **groups** category.
 
 ## 2. Install and run
 
@@ -51,6 +51,9 @@ Re-run `setup_config.py` if you move the folder or change the timeouts.
 | `/status` | Quick list of sessions. The pinned message in `#fleet` stays up to date too. |
 | `/stop session` | Pause a session on purpose. It shows as ⏹️ stopped, and other agents can't wake it. A message from you still does. |
 | Approve / Deny buttons in `#needs-you` | Answer a permission prompt. |
+| Type in `#thunderhead` | Talk to The ThunderHead, the lead session (below). Your first message there starts it. |
+| `/wipe` | Clear The ThunderHead's conversation and start it fresh. |
+| Type in a channel under **groups** | Post to every session in that group channel. |
 
 **From a terminal**
 
@@ -60,6 +63,28 @@ bin/th-claude --listen           # also waits for messages between turns
 bin/th-claude --remote           # permission prompts go to Discord first
 THUNDERHEAD_NAME=api bin/th-claude   # choose the session's name
 ```
+
+## The ThunderHead
+
+The ThunderHead is the lead session, and it outranks every other session. Tell it what you want done in `#thunderhead`, and it organizes the fleet:
+
+- **Group channels:** creates channels, adds and removes sessions, and closes them when the work is done.
+- **Sessions:** spawns and stops sessions.
+- **Messaging:** messages any session, including ones you stopped, and wakes them.
+- **Authority:** other sessions follow its instructions as they would yours, unless the instructions conflict with yours or would be destructive.
+
+Hop limits still apply to it, and it asks you before anything costly or destructive.
+
+It runs in `hq/`. Its conversation gets wiped (`/wipe`), so it keeps its memory in files:
+
+- `hq/CLAUDE.md`: its standing brief (role, powers, rules). It's in git. Edit it to change how The ThunderHead behaves.
+- `hq/NOTES.md`: its own notebook. It reads it at every start and writes down anything worth keeping. It isn't tracked by git.
+
+## Group channels
+
+A group channel lets several sessions talk one-to-many. Anything posted in it, by a member session (`post(channel, message)`) or by you in Discord, reaches every member. Only The ThunderHead can create channels and change who's in them. Each session can see its own channels with `channels()`.
+
+To keep channels from flooding, every post counts toward the hop limit, each channel allows 20 posts a minute, and sessions are told to reply only when they have something to add.
 
 ## Opening a fleet session somewhere else
 
