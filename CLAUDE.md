@@ -1,0 +1,31 @@
+# THUNDERHEAD
+
+Discord control plane for a fleet of Claude Code sessions. See README.md for what it does and how to use it.
+
+## Layout
+
+- `thunderhead/db.py`: SQLite schema and helpers. `data/thunderhead.db` is the only channel between processes.
+- `thunderhead/hooks.py`: Claude Code hook handlers (register, status, message delivery on Stop, remote approval, sleep).
+- `thunderhead/mcp_server.py`: tools each session gets (`status`, `report`, `send`, ...).
+- `thunderhead/bot.py`: Discord bot. Posts the outbox, writes your messages into `messages`, wakes and reaps sessions.
+- `hook.py`, `mcp_server.py`, `bot.py`: thin entry points. `setup_config.py` generates `config/*.json`.
+- `hq/`: working folder of The ThunderHead, the lead session. `hq/CLAUDE.md` is its standing brief.
+
+## Working on this repo
+
+- Run things with `.venv/bin/python`.
+- Test hooks and tools against a scratch database with `THUNDERHEAD_DB=<scratch path>` so nothing reaches Discord.
+- After changing `bot.py`, restart the bot: `kill $(cat data/bot.pid)`, then `nohup .venv/bin/python bot.py > data/bot.log 2>&1 & echo $! > data/bot.pid`.
+- Hooks pick up changes on their next run. The MCP server is loaded once per session, so tool changes only reach sessions started afterwards.
+- After changing hook events or timeouts, rerun `.venv/bin/python setup_config.py`.
+- `claude --bg` flag order matters: `--resume <id>` straight after `--bg`, and `--mcp-config=<path>` with `=`. See `bg_command`.
+- Never print, log or commit `.env` or the bot token.
+
+## Commits
+
+Commit early and often, without asking for permission first. Make a commit whenever a change works on its own: a fix, a feature step, a docs update. Don't wait until the end of a task.
+
+- Keep each commit to one logical change, with a message that says what changed and why.
+- Check `git status` before committing, so secrets (`.env`, `bot-token.md`) and runtime files (`data/`) stay out. `.gitignore` covers them. Keep it that way.
+- Don't commit broken code on `main`. If something is half-done, finish it or leave it uncommitted.
+- Pushing, rewriting history and deleting branches still need the user's go-ahead.
