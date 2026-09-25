@@ -4,7 +4,6 @@ import io
 import json
 import logging
 import os
-import re
 import secrets
 import shlex
 import time
@@ -15,8 +14,9 @@ from discord import app_commands
 from discord.ext import tasks
 
 from . import db as store
-from .config import MCP_FILE, ROOT, SETTINGS_FILE
+from .config import ROOT, SETTINGS_FILE
 from .hooks import _hops_after, format_messages
+from .launch import NAME_RE, bg_command, lead_command
 
 log = logging.getLogger("thunderhead")
 
@@ -24,10 +24,10 @@ TOKEN = os.environ.get("DISCORD_TOKEN", "")
 GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0") or 0)
 OWNER_ID = int(os.environ.get("DISCORD_OWNER_ID", "0") or 0)
 
-FLEET, NEEDS_YOU, CHATTER = "fleet", "needs-you", "agent-chatter"
+FLEET, NEEDS_YOU, CHATTER, LEAD_CHANNEL = "fleet", "needs-you", "agent-chatter", store.LEAD
+GROUPS = "groups"  # Discord category that holds the group channels
 ICONS = {"starting": "⏳", "working": "🟢", "listening": "🔵", "idle": "⚪",
          "needs_you": "🔴", "waking": "⏰", "sleeping": "💤", "stopped": "⏹️", "ended": "⚫", "gone": "⚫"}
-NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 MSG_LIMIT = 1900
 
 
@@ -124,12 +124,15 @@ class Thunderhead(discord.Client):
         if guild is None:
             log.error("Bot is not in guild %s. Check DISCORD_GUILD_ID and the invite.", GUILD_ID)
             return
-        for name in (FLEET, NEEDS_YOU, CHATTER):
+        for name in (FLEET, NEEDS_YOU, CHATTER, LEAD_CHANNEL):
             ch = discord.utils.get(guild.text_channels, name=name)
             if ch is None:
-                ch = await guild.create_text_channel(name)
+                topic = "Talk to The ThunderHead, the lead session. /wipe gives it a fresh start." \
+                    if name == LEAD_CHANNEL else None
+                ch = await guild.create_text_channel(name, topic=topic)
                 log.info("Created #%s", name)
             self.channels[name] = ch
+        self.guild = guild
         log.info("Logged in as %s; watching %s", self.user, guild.name)
         for loop in (self.pump, self.board, self.liveness):
             if not loop.is_running():
@@ -137,7 +140,12 @@ class Thunderhead(discord.Client):
 
     # -- session threads --
 
-    async def thread_for(self, conn, sess) -> discord.Thread:
+    async def thread_for(self, conn, sess) -> discord.abc.Messageable:
+        if sess["role"] == "lead":
+            ch = self.channels[LEAD_CHANNEL]
+            if sess["thread_id"] != ch.id:
+                conn.execute("UPDATE sessions SET thread_id=? WHERE name=?", (ch.id, sess["name"]))
+            return ch
         if sess["thread_id"]:
             ch = self.get_channel(sess["thread_id"])
             if ch is None:
@@ -185,8 +193,42 @@ class Thunderhead(discord.Client):
                     pass
                 conn.execute("UPDATE approvals SET closed=1 WHERE id=?", (ap["id"],))
 
+    async def group_channel(self, conn, name) -> discord.TextChannel:
+        """The Discord channel for a group channel, created on first use."""
+        ch_row = store.get_channel(conn, name)
+        if ch_row["discord_id"]:
+            ch = self.get_channel(ch_row["discord_id"])
+            if ch is not None:
+                return ch
+        category = discord.utils.get(self.guild.categories, name=GROUPS) \
+            or await self.guild.create_category(GROUPS)
+        ch = discord.utils.get(category.text_channels, name=name) \
+            or await self.guild.create_text_channel(name, category=category, topic=ch_row["topic"] or None)
+        conn.execute("UPDATE channels SET discord_id=? WHERE name=?", (ch.id, name))
+        return ch
+
+    async def post_channel_event(self, conn, ev, sess):
+        ch = await self.group_channel(conn, ev["channel"])
+        kind, body = ev["kind"], ev["body"]
+        who = sess["name"] if sess else "?"
+        if kind == "channel_created":
+            row = store.get_channel(conn, ev["channel"])
+            await ch.send(f"📣 **#{ev['channel']}** was created by The ThunderHead."
+                          + (f"\nTopic: {row['topic']}" if row["topic"] else "") + f"\n{body}\n"
+                          "Everything posted here, by a member or by you, goes to every member.")
+        elif kind == "channel_post":
+            await send_long(ch, body, prefix=f"**{who}**: ")
+        elif kind == "channel_note":
+            await ch.send(body)
+        elif kind == "channel_closed":
+            await ch.send("🔒 This channel was closed by The ThunderHead. Sessions no longer receive posts here.")
+            await ch.set_permissions(self.guild.default_role, send_messages=False)
+
     async def post_event(self, conn, ev):
         sess = store.get_session(conn, ev["session_id"])
+        if ev["channel"]:
+            await self.post_channel_event(conn, ev, sess)
+            return
         if sess is None:
             return
         thread = await self.thread_for(conn, sess)
@@ -265,7 +307,7 @@ class Thunderhead(discord.Client):
         with store.db() as conn:
             # session id -> (oldest undelivered message time, whether any is from the human)
             mail = {r[0]: (r[1], bool(r[2])) for r in conn.execute(
-                "SELECT to_session, MIN(created_at), MAX(from_kind='human') FROM messages "
+                "SELECT to_session, MIN(created_at), MAX(from_kind IN ('human', 'lead')) FROM messages "
                 "WHERE delivered_at IS NULL GROUP BY to_session")}
 
             for s in store.live_sessions(conn):
@@ -299,10 +341,11 @@ class Thunderhead(discord.Client):
                         and time.time() - mail[s["id"]][0] > 15):
                     to_wake.append(s)
 
-            # Stopped or ended sessions come back when the human writes to them.
-            for sid, (_, from_human) in mail.items():
+            # Stopped or ended sessions come back when the human or The ThunderHead writes to them.
+            for sid, (_, authoritative) in mail.items():
                 s = store.get_session(conn, sid)
-                if (s and s["status"] in store.DEAD and from_human and sid not in self.waking
+                if (s and s["status"] in store.DEAD and s["status"] != "wiped" and authoritative
+                        and sid not in self.waking
                         and store.session_by_name(conn, s["name"])["id"] == sid):
                     to_wake.append(s)
 
@@ -336,7 +379,7 @@ class Thunderhead(discord.Client):
                 # Fails harmlessly when the process has already exited.
                 await run_claude(["claude", "stop", short_id(sid)])
                 code, text = await run_claude(
-                    bg_command(sess["name"], resume=sid) + [format_messages(rows)], cwd=sess["cwd"])
+                    bg_command(sess["name"], resume=sid, role=sess["role"]) + [format_messages(rows)], cwd=sess["cwd"])
             with store.db() as conn:
                 if code == 0:
                     self.wake_failed.pop(sid, None)
@@ -356,18 +399,47 @@ class Thunderhead(discord.Client):
     # -- your messages --
 
     async def on_message(self, message: discord.Message):
-        if message.author.bot or not isinstance(message.channel, discord.Thread):
+        if message.author.bot or message.guild is None:
             return
+        channel = message.channel
         with store.db() as conn:
-            sess = store.session_by_thread(conn, message.channel.id)
-            if sess is None:
+            group = store.channel_by_discord(conn, channel.id)
+            if channel.id == self.channels[LEAD_CHANNEL].id:
+                sess = store.session_by_name(conn, store.LEAD)
+                if sess is not None and sess["status"] == "wiped":
+                    sess = None
+            elif isinstance(channel, discord.Thread):
+                sess = store.session_by_thread(conn, channel.id)
+            else:
+                sess = None
+            if sess is None and group is None and channel.id != self.channels[LEAD_CHANNEL].id:
                 return
             if not is_owner(message.author):
                 await message.add_reaction("⛔")
                 return
-            store.queue_message(conn, sess["id"], "human", message.author.display_name, message.content)
+            if group is not None:
+                got = store.fan_out(conn, group["name"], "human", message.author.display_name, message.content)
+                targets = [store.session_by_name(conn, n) for n in got]
+            elif sess is None:
+                targets = None  # no ThunderHead yet
+            else:
+                store.queue_message(conn, sess["id"], "human", message.author.display_name, message.content)
+                targets = [sess]
+        if targets is None:
+            await self.start_lead(first_message=message.content)
+            await message.add_reaction("⚡")
+            return
         await message.add_reaction("📨")
-        await self.deliver_now(sess, message)
+        for t in targets:
+            await self.deliver_now(t, message if group is None else None)
+
+    async def start_lead(self, first_message: str | None = None) -> tuple[int, str]:
+        """Start a fresh ThunderHead: no earlier conversation, memory from hq/NOTES.md."""
+        cmd, cwd = lead_command(first_message)
+        code, text = await run_claude(cmd, cwd=cwd)
+        await self.channels[LEAD_CHANNEL].send(
+            "⚡ Starting a fresh ThunderHead…" if code == 0 else f"Couldn't start The ThunderHead:\n```\n{text}\n```")
+        return code, text
 
     async def deliver_now(self, sess, message=None):
         """Wake a sleeping or stopped session right away instead of waiting for the next check."""
@@ -382,18 +454,6 @@ bot = Thunderhead()
 
 
 # --- running claude ---------------------------------------------------------
-
-def bg_command(name: str, resume: str | None = None) -> list[str]:
-    """`claude --bg` connected to the fleet, listening, with approvals sent to Discord.
-
-    `--resume` has to come straight after `--bg`, and `--mcp-config` takes several values,
-    so it's passed as `--mcp-config=` to stop it swallowing the prompt that follows.
-    """
-    settings = json.loads(SETTINGS_FILE.read_text())
-    settings["env"] = {"THUNDERHEAD_NAME": name, "THUNDERHEAD_LISTEN": "1", "THUNDERHEAD_REMOTE_APPROVAL": "1"}
-    cmd = ["claude", "--bg"] + (["--resume", resume] if resume else [])
-    return cmd + ["-n", name, "--settings", json.dumps(settings), f"--mcp-config={MCP_FILE}"]
-
 
 async def run_claude(cmd: list[str], cwd=None, timeout=60, tail: int | None = 1500) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(*cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE,
@@ -486,8 +546,9 @@ async def spawn(interaction: discord.Interaction, directory: str, task: str,
         await interaction.response.send_message(f"`{cwd}` is not a directory.", ephemeral=True)
         return
     name = name or f"{cwd.name or 'root'}-{secrets.token_hex(2)}"
-    if not NAME_RE.match(name):
-        await interaction.response.send_message("Names can only use letters, digits, - and _.", ephemeral=True)
+    if not NAME_RE.match(name) or name == store.LEAD:
+        await interaction.response.send_message("Names can only use letters, digits, - and _ "
+                                                "('thunderhead' is taken by The ThunderHead).", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -529,6 +590,26 @@ async def stop(interaction: discord.Interaction, session: str):
                                         f"stopped from here):\n```\n{text}\n```", ephemeral=True)
         return
     await interaction.followup.send(f"⏹️ Stopped **{session}**. Its conversation is kept.\n{resume_hint(sess)}",
+                                    ephemeral=True)
+
+
+@bot.tree.command(description="Give The ThunderHead a fresh start (its memory comes from hq/NOTES.md)")
+async def wipe(interaction: discord.Interaction):
+    if not await owner_only(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    with store.db() as conn:
+        lead = store.session_by_name(conn, store.LEAD)
+        if lead is not None and lead["status"] not in store.DEAD:
+            # 'stopped' keeps SessionEnd quiet; then retire it so nothing resumes the old conversation.
+            store.set_status(conn, lead["id"], "stopped")
+    if lead is not None:
+        await run_claude(["claude", "stop", short_id(lead["id"])])
+        with store.db() as conn:
+            store.set_status(conn, lead["id"], "wiped")
+    await bot.channels[LEAD_CHANNEL].send("🧹 **Wiped.** The ThunderHead's conversation was cleared.")
+    code, text = await bot.start_lead()
+    await interaction.followup.send("Fresh ThunderHead starting." if code == 0 else f"Failed:\n```\n{text}\n```",
                                     ephemeral=True)
 
 

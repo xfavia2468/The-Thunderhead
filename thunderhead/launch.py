@@ -1,0 +1,59 @@
+"""Building `claude` command lines for fleet sessions. Used by the bot and The ThunderHead's tools."""
+import json
+import re
+import subprocess
+
+from . import db as store
+from .config import MCP_FILE, ROOT, SETTINGS_FILE
+
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+HQ = ROOT / "hq"
+NOTES = HQ / "NOTES.md"
+
+LEAD_BOOT = """[thunderhead] You are The ThunderHead, starting fresh. Your earlier conversation was wiped.
+Read NOTES.md now: it's your memory. Then call fleet() to see the current state, post a two-line \
+"back online" summary with report(), and handle the message below if there is one."""
+
+NOTES_TEMPLATE = """# ThunderHead notes
+
+Your memory across wipes. Keep it short and current: rewrite stale parts instead of only appending.
+
+## Standing instructions from the human
+
+## Channels and what they're for
+
+## Sessions and what they're doing
+
+## Decisions and open threads
+"""
+
+
+def bg_command(name: str, resume: str | None = None, role: str = "worker") -> list[str]:
+    """`claude --bg` connected to the fleet, listening, with approvals sent to Discord.
+
+    `--resume` has to come straight after `--bg`, and `--mcp-config` takes several values,
+    so it's passed as `--mcp-config=` to stop it swallowing the prompt that follows.
+    """
+    settings = json.loads(SETTINGS_FILE.read_text())
+    settings["env"] = {"THUNDERHEAD_NAME": name, "THUNDERHEAD_LISTEN": "1",
+                       "THUNDERHEAD_REMOTE_APPROVAL": "1", "THUNDERHEAD_ROLE": role}
+    cmd = ["claude", "--bg"] + (["--resume", resume] if resume else [])
+    return cmd + ["-n", name, "--settings", json.dumps(settings), f"--mcp-config={MCP_FILE}"]
+
+
+def lead_command(first_message: str | None = None) -> tuple[list[str], str]:
+    """A fresh ThunderHead session: (command, working directory)."""
+    HQ.mkdir(exist_ok=True)
+    if not NOTES.exists():
+        NOTES.write_text(NOTES_TEMPLATE)
+    prompt = LEAD_BOOT + (f"\n\n--- from the human (Discord) ---\n{first_message}" if first_message else "")
+    return bg_command(store.LEAD, role="lead") + [prompt], str(HQ)
+
+
+def run(cmd: list[str], cwd=None, timeout=60) -> tuple[int, str]:
+    """Synchronous run for the MCP server (the bot has an async twin)."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 1, f"`{' '.join(cmd[:2])}` didn't return within {timeout}s."
+    return p.returncode, (p.stdout + p.stderr).strip()[-1500:]

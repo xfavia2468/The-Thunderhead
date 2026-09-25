@@ -66,11 +66,39 @@ CREATE TABLE IF NOT EXISTS approvals (
 );
 
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
+
+-- Group channels: every member session gets every post. Members are session
+-- names, which survive a session being resumed under a new id.
+CREATE TABLE IF NOT EXISTS channels (
+    name        TEXT PRIMARY KEY,
+    topic       TEXT DEFAULT '',
+    discord_id  INTEGER,                -- Discord text channel, once the bot has made it
+    created_by  TEXT,
+    created_at  REAL,
+    closed      INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS channel_members (
+    channel      TEXT NOT NULL,
+    session_name TEXT NOT NULL,
+    added_at     REAL,
+    PRIMARY KEY (channel, session_name)
+);
 """
 
-# Statuses that mean the session is no longer running. 'stopped' is a stop from
-# Discord; the conversation is kept and /resume can bring it back.
-DEAD = ("ended", "gone", "stopped")
+# Columns added after the first release. Each runs once; "duplicate column" means done.
+MIGRATIONS = [
+    "ALTER TABLE sessions ADD COLUMN role TEXT DEFAULT 'worker'",
+    "ALTER TABLE messages ADD COLUMN channel TEXT",
+    "ALTER TABLE outbox ADD COLUMN channel TEXT",
+]
+
+# The lead session: its name, and the role that unlocks its tools.
+LEAD = "thunderhead"
+
+# Statuses that mean the session is no longer running. 'stopped' was paused on
+# purpose and a message wakes it; 'wiped' is a ThunderHead cleared by /wipe, which
+# nothing may resume.
+DEAD = ("ended", "gone", "stopped", "wiped")
 # Asleep after sitting idle: its process is shut down, but any message wakes it.
 # Not in DEAD, so it still counts as part of the fleet.
 SLEEPING = "sleeping"
@@ -83,6 +111,12 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
     conn.executescript(SCHEMA)
+    for sql in MIGRATIONS:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e):
+                raise
     return conn
 
 
@@ -101,7 +135,7 @@ def now() -> float:
 
 # --- sessions ---------------------------------------------------------------
 
-def upsert_session(conn, sid, *, name, cwd, pid, listen, remote_approval):
+def upsert_session(conn, sid, *, name, cwd, pid, listen, remote_approval, role="worker"):
     ts = now()
     # A resumed or cleared session keeps its name; reuse that name's thread.
     prev = conn.execute(
@@ -109,16 +143,16 @@ def upsert_session(conn, sid, *, name, cwd, pid, listen, remote_approval):
         "ORDER BY updated_at DESC LIMIT 1", (name,)).fetchone()
     conn.execute(
         """INSERT INTO sessions (id, name, cwd, pid, status, listen, remote_approval,
-                                 thread_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?)
+                                 thread_id, created_at, updated_at, role)
+           VALUES (?, ?, ?, ?, 'starting', ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
                name=excluded.name, cwd=excluded.cwd, pid=excluded.pid,
                status='starting', listen=excluded.listen,
-               remote_approval=excluded.remote_approval,
+               remote_approval=excluded.remote_approval, role=excluded.role,
                thread_id=COALESCE(sessions.thread_id, excluded.thread_id),
                updated_at=excluded.updated_at""",
         (sid, name, cwd, pid, int(listen), int(remote_approval),
-         prev["thread_id"] if prev else None, ts, ts))
+         prev["thread_id"] if prev else None, ts, ts, role))
 
 
 def get_session(conn, sid):
@@ -158,17 +192,18 @@ def set_status(conn, sid, status, summary=None):
 
 # --- messages ---------------------------------------------------------------
 
-def queue_message(conn, to_session, from_kind, from_name, body, hops=0):
+def queue_message(conn, to_session, from_kind, from_name, body, hops=0, channel=None):
+    """from_kind is 'human', 'lead' (The ThunderHead) or 'agent'."""
     conn.execute(
-        "INSERT INTO messages (to_session, from_kind, from_name, body, hops, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)", (to_session, from_kind, from_name, body, hops, now()))
+        "INSERT INTO messages (to_session, from_kind, from_name, body, hops, channel, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)", (to_session, from_kind, from_name, body, hops, channel, now()))
 
 
 def take_messages(conn, sid):
     """Atomically claim every undelivered message for a session."""
     rows = conn.execute(
         "UPDATE messages SET delivered_at=? WHERE to_session=? AND delivered_at IS NULL "
-        "RETURNING id, from_kind, from_name, body, hops", (now(), sid)).fetchall()
+        "RETURNING id, from_kind, from_name, body, hops, channel", (now(), sid)).fetchall()
     return sorted(rows, key=lambda r: r["id"])
 
 
@@ -179,9 +214,9 @@ def pending_count(conn, sid):
 
 # --- outbox -----------------------------------------------------------------
 
-def post(conn, sid, kind, body):
-    conn.execute("INSERT INTO outbox (session_id, kind, body, created_at) VALUES (?, ?, ?, ?)",
-                 (sid, kind, body, now()))
+def post(conn, sid, kind, body, channel=None):
+    conn.execute("INSERT INTO outbox (session_id, kind, body, channel, created_at) VALUES (?, ?, ?, ?, ?)",
+                 (sid, kind, body, channel, now()))
 
 
 # --- approvals --------------------------------------------------------------
@@ -199,6 +234,55 @@ def decide_approval(conn, approval_id, decision) -> bool:
         "UPDATE approvals SET status=?, decided_at=? WHERE id=? AND status='pending'",
         (decision, now(), approval_id))
     return cur.rowcount == 1
+
+
+# --- group channels ---------------------------------------------------------
+
+CHANNEL_RE = r"^[a-z0-9][a-z0-9-]{0,39}$"
+# Discord channels the bot already uses.
+RESERVED_CHANNELS = ("fleet", "needs-you", "agent-chatter", LEAD)
+
+
+def get_channel(conn, name):
+    return conn.execute("SELECT * FROM channels WHERE name=?", (name,)).fetchone()
+
+
+def channel_by_discord(conn, discord_id):
+    return conn.execute("SELECT * FROM channels WHERE discord_id=? AND closed=0", (discord_id,)).fetchone()
+
+
+def open_channels(conn):
+    return conn.execute("SELECT * FROM channels WHERE closed=0 ORDER BY created_at").fetchall()
+
+
+def members(conn, channel) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT session_name FROM channel_members WHERE channel=? ORDER BY added_at", (channel,))]
+
+
+def channels_of(conn, session_name) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT m.channel FROM channel_members m JOIN channels c ON c.name=m.channel "
+        "WHERE m.session_name=? AND c.closed=0 ORDER BY c.created_at", (session_name,))]
+
+
+def fan_out(conn, channel, from_kind, from_name, body, hops=0) -> list[str]:
+    """Queue a channel post for every member except the sender. Returns who got it."""
+    got = []
+    for name in members(conn, channel):
+        if from_kind != "human" and name == from_name:
+            continue
+        target = session_by_name(conn, name)
+        if target is None:
+            continue
+        queue_message(conn, target["id"], from_kind, from_name, body, hops=hops, channel=channel)
+        got.append(name)
+    return got
+
+
+def recent_posts(conn, channel, seconds=60) -> int:
+    return conn.execute("SELECT COUNT(*) FROM outbox WHERE kind='channel_post' AND channel=? AND created_at>?",
+                        (channel, now() - seconds)).fetchone()[0]
 
 
 # --- kv ---------------------------------------------------------------------
