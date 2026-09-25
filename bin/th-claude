@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Start Claude Code connected to THUNDERHEAD. Takes any normal `claude` arguments.
+#   th-claude                 interactive session; you get messages when a turn ends
+#   th-claude --listen        also waits for messages between turns, so Discord can wake it
+#   th-claude --remote        permission prompts go to Discord buttons first
+set -euo pipefail
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+args=()
+for a in "$@"; do
+  case "$a" in
+    --listen) export THUNDERHEAD_LISTEN=1 ;;
+    --remote) export THUNDERHEAD_REMOTE_APPROVAL=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+exec claude --settings "$ROOT/config/settings.json" --mcp-config "$ROOT/config/mcp.json" "${args[@]}"
