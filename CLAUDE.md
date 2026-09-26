@@ -17,7 +17,7 @@ Discord control plane for a fleet of Claude Code sessions. See README.md for wha
 
 - Run things with `.venv/bin/python`.
 - Test hooks and tools against a scratch database with `THUNDERHEAD_DB=<scratch path>` so nothing reaches Discord.
-- After changing `bot.py`, restart the bot: `kill $(cat data/bot.pid)`, then `nohup .venv/bin/python bot.py > data/bot.log 2>&1 & echo $! > data/bot.pid`.
+- The bot runs as a systemd user service (`deploy/thunderhead-bot.service`). After changing `bot.py` or anything it imports, restart it: `systemctl --user restart thunderhead-bot`. Its log is `data/bot.log`. Don't start a second copy by hand.
 - Hooks pick up changes on their next run. The MCP server is loaded once per session, so tool changes only reach sessions started afterwards.
 - After changing hook events or timeouts, rerun `.venv/bin/python setup_config.py`.
 - `claude --bg` flag order matters: `--resume <id>` straight after `--bg`, and `--mcp-config=<path>` with `=`. See `bg_command`.

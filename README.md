@@ -45,6 +45,19 @@ cp .env.example .env        # fill in the three values
 
 Re-run `setup_config.py` if you move the folder or change the timeouts.
 
+### Keep the bot running
+
+Run the bot as a systemd user service, so it starts with WSL (or your machine) and restarts itself if it crashes. This needs systemd, which WSL enables with `systemd=true` under `[boot]` in `/etc/wsl.conf`.
+
+```bash
+cp deploy/thunderhead-bot.service ~/.config/systemd/user/   # edit paths inside if the repo isn't at ~/THUNDERHEAD
+systemctl --user daemon-reload && systemctl --user enable --now thunderhead-bot
+loginctl enable-linger "$USER"      # keep it running without a terminal open
+systemctl --user status thunderhead-bot   # restart | stop | status; the log is data/bot.log
+```
+
+On WSL, this starts the bot whenever WSL starts. WSL itself doesn't start with Windows; that takes a Task Scheduler task at login.
+
 ## 3. Use it
 
 **From Discord**

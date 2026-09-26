@@ -1,0 +1,23 @@
+# THUNDERHEAD's Discord bot as a systemd user service.
+# Install:  cp deploy/thunderhead-bot.service ~/.config/systemd/user/
+#           systemctl --user daemon-reload && systemctl --user enable --now thunderhead-bot
+#           loginctl enable-linger "$USER"   # keep it running without a login session
+# Assumes the repo is at ~/THUNDERHEAD and `claude` is in ~/.local/bin; edit the paths if not.
+
+[Unit]
+Description=THUNDERHEAD Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/THUNDERHEAD
+ExecStart=%h/THUNDERHEAD/.venv/bin/python bot.py
+# The bot runs `claude` to start, stop and wake sessions.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:%h/THUNDERHEAD/data/bot.log
+StandardError=append:%h/THUNDERHEAD/data/bot.log
+
+[Install]
+WantedBy=default.target
