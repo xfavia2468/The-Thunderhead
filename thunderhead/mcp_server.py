@@ -1,17 +1,16 @@
 """Per-session MCP server: the tools a Claude session uses to talk to the fleet.
 
-The ThunderHead (the lead session) gets extra tools on top. They are only registered
-when this server runs inside it, and each one checks the caller's role again.
+Supervisors and The ThunderHead get extra tools on top. They're only registered
+when this server runs inside a session with that role, and each one checks the
+caller's place in the org chart again.
 """
 import json
 import os
-import re
-from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
 from . import db as store
-from . import launch
+from . import launch, org
 from .config import MAX_HOPS
 from .hooks import _hops_after, delivery
 
@@ -20,6 +19,8 @@ mcp = MCPServer("thunderhead", instructions="Talk to the human (via Discord) and
 STATES = ("working", "blocked", "done")
 # Posts per channel per minute before post() refuses, so a busy channel can't flood everyone.
 CHANNEL_RATE = 20
+HOPS_REFUSAL = (f"Refused: this chain of agent messages has gone {MAX_HOPS} hops without the human. "
+                "Use report() to ask the human how to proceed.")
 
 
 def _me(conn):
@@ -39,17 +40,13 @@ def _is_lead(me) -> bool:
     return me["role"] == "lead" and me["name"] == store.LEAD
 
 
-def _kind(me) -> str:
-    return "lead" if _is_lead(me) else "agent"
-
-
-def _next_hops(me) -> int | None:
+def _hops(conn, me, recipients) -> int | None:
+    """Hop count for a message. Going down the org chart is free (delegation can't loop: the
+    chart has a bottom); going up or sideways counts, so back-and-forth is still capped."""
+    if recipients and all(store.is_down(conn, me["name"], r) for r in recipients):
+        return me["current_hops"]
     hops = me["current_hops"] + 1
     return None if hops > MAX_HOPS else hops
-
-
-HOPS_REFUSAL = (f"Refused: this conversation between agents has gone {MAX_HOPS} hops without the human. "
-                "Use report() to ask the human how to proceed.")
 
 
 # --- every session ----------------------------------------------------------
@@ -90,15 +87,20 @@ def send(to: str, message: str) -> str:
         lead = _is_lead(me)
         if target is None or (target["status"] in store.DEAD and not lead):
             names = ", ".join(s["name"] for s in store.live_sessions(conn) if s["id"] != me["id"])
-            why = "was stopped by the human" if target and target["status"] == "stopped" else "isn't running"
+            why = "was stopped" if target and target["status"] == "stopped" else "isn't running"
             return (f"'{to}' {why}; only the human or The ThunderHead can restart it. "
                     f"Sessions you can message: {names or 'none'}.")
         if target["id"] == me["id"]:
             return "That is you."
-        hops = _next_hops(me)
+        role, team = store.rank(conn, to)
+        if lead and role == "dev":
+            sup = store.get_team(conn, team)["supervisor"]
+            return (f"'{to}' is a dev on team '{team}'. Route work through its supervisor: send('{sup}', ...). "
+                    "In an emergency, use emergency_stop().")
+        hops = _hops(conn, me, [to])
         if hops is None:
             return HOPS_REFUSAL
-        store.queue_message(conn, target["id"], _kind(me), me["name"], message, hops=hops)
+        store.queue_message(conn, target["id"], org._kind(conn, me["name"]), me["name"], message, hops=hops)
         store.post(conn, me["id"], "agent_msg", f"📤 to **{target['name']}** (hop {hops}): {message}")
         store.post(conn, target["id"], "agent_msg_in", f"📥 from **{me['name']}** (hop {hops}): {message}")
     if target["status"] in store.DEAD + (store.SLEEPING,):
@@ -120,19 +122,20 @@ def post(channel: str, message: str, notify: list[str]) -> str:
         ch = store.get_channel(conn, channel.lstrip("#"))
         if ch is None or ch["closed"]:
             return f"No open channel #{channel}. channels() lists yours."
-        if me["name"] not in store.members(conn, ch["name"]) and not _is_lead(me):
-            return f"You aren't a member of #{ch['name']}. Ask The ThunderHead to add you."
         roster = store.members(conn, ch["name"])
+        if me["name"] not in roster and not _is_lead(me):
+            return f"You aren't a member of #{ch['name']}."
         unknown = [n for n in notify if n != "all" and n not in roster]
         if not notify or unknown:
             return (f"notify must name members of #{ch['name']} ({', '.join(roster)}) or be [\"all\"]"
                     + (f"; not members: {', '.join(unknown)}" if unknown else "") + ".")
         if store.recent_posts(conn, ch["name"]) >= CHANNEL_RATE:
             return f"#{ch['name']} is busy ({CHANNEL_RATE} posts in the last minute). Wait, then try again."
-        hops = _next_hops(me)
+        targets = [m for m in roster if m != me["name"]] if "all" in notify else notify
+        hops = _hops(conn, me, targets)
         if hops is None:
             return HOPS_REFUSAL
-        got = store.fan_out(conn, ch["name"], _kind(me), me["name"], message, notify, hops=hops)
+        got = store.fan_out(conn, ch["name"], org._kind(conn, me["name"]), me["name"], message, notify, hops=hops)
         pinged = "everyone" if "all" in notify else ", ".join(f"@{n}" for n in got) or "nobody"
         store.post(conn, me["id"], "channel_post", f"→ {pinged}\n{message}", channel=ch["name"])
     return f"Posted to #{ch['name']}; notified {', '.join(got) or 'nobody'}."
@@ -150,12 +153,12 @@ def read_channel(channel: str, limit: int = 20) -> str:
     if not rows:
         return f"#{name} has no posts yet."
     return "\n\n".join(f"[{r['from_name']} → {', '.join(json.loads(r['notified'])) or 'nobody'}]\n{r['body']}"
-                        for r in rows)
+                       for r in rows)
 
 
 @mcp.tool()
 def channels() -> str:
-    """List the group channels you're in, with their topic and members."""
+    """List the group channels you're in, with their topic, members and unread count."""
     with store.db() as conn:
         me = _me(conn)
         names = ([c["name"] for c in store.open_channels(conn)] if _is_lead(me)
@@ -170,13 +173,34 @@ def channels() -> str:
 
 @mcp.tool()
 def sessions() -> str:
-    """List the other sessions in the fleet with their status and what they are working on."""
+    """List the other sessions in the fleet with their team, status and what they are working on."""
     with store.db() as conn:
         me = _me(conn)
-        rows = [s for s in store.live_sessions(conn) if s["id"] != me["id"]]
-    if not rows:
-        return "No other live sessions."
-    return "\n".join(f"- {s['name']} [{s['status']}] {s['summary'] or ''} (cwd: {s['cwd']})" for s in rows)
+        lines = []
+        for s in store.live_sessions(conn):
+            if s["id"] == me["id"]:
+                continue
+            role, team = store.rank(conn, s["name"])
+            where = f"{role} of {team}" if team else role
+            lines.append(f"- {s['name']} ({where}) [{s['status']}] {s['summary'] or ''}")
+    return "\n".join(lines) or "No other live sessions."
+
+
+@mcp.tool()
+def team() -> str:
+    """Your team: supervisor, devs, their status, and the team channel."""
+    with store.db() as conn:
+        me = _me(conn)
+        t = store.team_of(conn, me["name"])
+        if t is None:
+            return "You're not on a team."
+        lines = [f"Team {t['name']}: {t['topic'] or ''} (repos: {', '.join(json.loads(t['repos']))})",
+                 f"Team channel: #{t['name']}"]
+        for name in store.team_members_of(conn, t["name"]):
+            s = store.session_by_name(conn, name)
+            label = "supervisor" if name == t["supervisor"] else "dev"
+            lines.append(f"- {name} ({label}) [{s['status'] if s else 'not started'}] {(s and s['summary']) or ''}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -190,114 +214,193 @@ def inbox() -> str:
         return delivery(conn, me["id"], rows) if rows else "No new messages."
 
 
-# --- The ThunderHead only ---------------------------------------------------
+# --- supervisors and The ThunderHead ----------------------------------------
 
-def _lead_only(conn):
+def _require(conn, *roles):
     me = _me(conn)
-    if not _is_lead(me):
-        raise PermissionError("Only The ThunderHead can do that.")
-    return me
+    role, team = store.rank(conn, me["name"])
+    if role not in roles or (role == "lead" and not _is_lead(me)):
+        raise PermissionError(f"Only {' or '.join(roles)} sessions can do that.")
+    return me, role, team
 
 
-def _notify(conn, lead, names, text):
-    """A direct note from The ThunderHead to each named session."""
-    for name in names:
-        target = store.session_by_name(conn, name)
-        if target is not None and name != lead["name"]:
-            store.queue_message(conn, target["id"], "lead", lead["name"], text, hops=1)
-
-
-def _unknown(conn, names) -> list[str]:
-    return [n for n in names if store.session_by_name(conn, n) is None]
-
-
-def fleet() -> str:
-    """Everything at a glance: every session (including stopped ones from the last day), every channel, queued mail."""
-    with store.db() as conn:
-        _lead_only(conn)
-        rows = conn.execute(
-            f"SELECT * FROM sessions WHERE status NOT IN {store.DEAD} OR updated_at > ? "
-            f"ORDER BY status IN {store.DEAD}, created_at", (store.now() - 86400,)).fetchall()
-        current = {}
-        for s in rows:  # one row per name: the current one
-            if s["name"] not in current and store.session_by_name(conn, s["name"])["id"] == s["id"]:
-                current[s["name"]] = s
-        lines = ["Sessions:"]
-        for s in current.values():
-            mail = store.pending_count(conn, s["id"])
-            lines.append(f"- {s['name']} [{s['status']}] {s['summary'] or ''} (cwd: {s['cwd']}"
-                         + (f", {mail} queued" if mail else "") + ")")
-        lines.append("Channels:")
-        for c in store.open_channels(conn):
-            lines.append(f"- #{c['name']}: {c['topic'] or 'no topic'} (members: {', '.join(store.members(conn, c['name']))})")
-        if len(lines) == 2:
-            lines.append("- none")
-    return "\n".join(lines)
+def _outside_team(conn, names, team) -> list[str]:
+    return [n for n in names if (store.team_of(conn, n) or {"name": None})["name"] != team]
 
 
 def create_channel(name: str, members: list[str], topic: str = "") -> str:
-    """Create a group channel (also a Discord text channel) and add sessions to it.
+    """Create a group channel (also a Discord text channel) and add sessions to it. You're added too.
 
-    name: lowercase letters, digits and dashes. members: session names. You're added automatically.
-    Each member is told it was added, who else is there, and how to post.
+    The ThunderHead can include anyone. A supervisor can create channels among its own team without
+    asking (The ThunderHead is told); a channel with other teams' sessions needs request("channel", ...).
     """
-    name = name.lstrip("#").lower()
-    if not re.match(store.CHANNEL_RE, name) or name in store.RESERVED_CHANNELS:
-        return "Pick another name: lowercase letters, digits and dashes, not fleet/needs-you/agent-chatter/thunderhead."
     with store.db() as conn:
-        lead = _lead_only(conn)
-        if store.get_channel(conn, name):
-            return f"#{name} already exists. Use add_to_channel()."
-        missing = _unknown(conn, members)
-        if missing:
-            return f"No sessions named {', '.join(missing)}. fleet() lists them."
-        conn.execute("INSERT INTO channels (name, topic, created_by, created_at) VALUES (?, ?, ?, ?)",
-                     (name, topic, lead["name"], store.now()))
-        everyone = list(dict.fromkeys([lead["name"], *members]))
-        conn.executemany("INSERT INTO channel_members (channel, session_name, added_at) VALUES (?, ?, ?)",
-                         [(name, m, store.now()) for m in everyone])
-        _notify(conn, lead, members,
-                f"You've been added to the group channel #{name}"
-                + (f" (topic: {topic})" if topic else "")
-                + f". Members: {', '.join(everyone)}. Use post('{name}', ...) to talk to all of them.")
-        store.post(conn, lead["id"], "channel_created", f"Members: {', '.join(everyone)}", channel=name)
-    return f"Created #{name} with {', '.join(everyone)}."
+        me, role, team = _require(conn, "lead", "supervisor")
+        if role == "supervisor":
+            outside = _outside_team(conn, members, team)
+            if outside:
+                return (f"{', '.join(outside)} aren't on your team. For a cross-team channel, use "
+                        "request('channel', {name, members, topic}, reason).")
+        result = org.create_channel(conn, me["name"], name, members, topic,
+                                    team=team if role == "supervisor" else None)
+        if role == "supervisor" and result.startswith("Created"):
+            org.fyi(conn, store.LEAD, f"Supervisor {me['name']} created team channel #{name.lower()} "
+                                      f"with {', '.join(members)}" + (f": {topic}" if topic else "") + ".")
+    return result
 
 
 def add_to_channel(channel: str, sessions: list[str]) -> str:
-    """Add sessions to a group channel. Each is told it was added."""
+    """Add sessions to a group channel. Each is told. Supervisors can only do this for their team's channels."""
     channel = channel.lstrip("#")
     with store.db() as conn:
-        lead = _lead_only(conn)
+        me, role, team = _require(conn, "lead", "supervisor")
         ch = store.get_channel(conn, channel)
         if ch is None or ch["closed"]:
             return f"No open channel #{channel}."
-        missing = _unknown(conn, sessions)
+        if role == "supervisor" and (ch["team"] != team or _outside_team(conn, sessions, team)):
+            return "Supervisors can only add their own devs to their own team's channels. Use request() otherwise."
+        missing = org.unknown_sessions(conn, sessions)
         if missing:
             return f"No sessions named {', '.join(missing)}."
-        current = store.members(conn, channel)
-        new = [s for s in dict.fromkeys(sessions) if s not in current]
-        conn.executemany("INSERT INTO channel_members (channel, session_name, added_at) VALUES (?, ?, ?)",
-                         [(channel, m, store.now()) for m in new])
-        everyone = current + new
-        _notify(conn, lead, new, f"You've been added to #{channel}"
-                + (f" (topic: {ch['topic']})" if ch["topic"] else "")
-                + f". Members: {', '.join(everyone)}. Use post('{channel}', ...) to talk to all of them.")
-        if new:
-            store.post(conn, lead["id"], "channel_note", f"➕ Added {', '.join(new)}.", channel=channel)
+        new = org.add_to_channel(conn, me["name"], channel, sessions)
     return f"Added {', '.join(new) or 'nobody new'} to #{channel}."
+
+
+def request(action: str, details: dict, reason: str) -> str:
+    """Ask The ThunderHead to do something only it can do. It approves, rejects, or asks the human.
+
+    action: "spawn" (details: directory, task, name) for a new dev on your team, "channel"
+    (details: name, members, topic) for a channel with other teams' sessions, or "other"
+    (details: anything) for everything else. reason: why the team needs it.
+    """
+    with store.db() as conn:
+        me, _, _ = _require(conn, "supervisor")
+        return org.create_request(conn, me, action, details, reason)
+
+
+# --- The ThunderHead only ---------------------------------------------------
+
+def _lead(conn):
+    return _require(conn, "lead")[0]
+
+
+def fleet() -> str:
+    """Everything at a glance: teams with their sessions, sessions without a team, channels and open requests."""
+    with store.db() as conn:
+        _lead(conn)
+
+        def line(name):
+            s = store.session_by_name(conn, name)
+            if s is None:
+                return f"  - {name} [not started]"
+            mail = store.pending_count(conn, s["id"])
+            return f"  - {name} [{s['status']}] {s['summary'] or ''}" + (f" ({mail} queued)" if mail else "")
+
+        lines, teamed = ["Teams:"], set()
+        for t in store.all_teams(conn):
+            members = store.team_members_of(conn, t["name"])
+            teamed.update(members)
+            lines.append(f"- {t['name']}: {t['topic'] or ''} (supervisor {t['supervisor']}; "
+                         f"repos: {', '.join(json.loads(t['repos']))})")
+            lines += [line(m) + (" (supervisor)" if m == t["supervisor"] else "") for m in members]
+        if len(lines) == 1:
+            lines.append("- none")
+        loose = [s for s in store.live_sessions(conn) if s["name"] not in teamed and s["name"] != store.LEAD]
+        lines.append("Sessions without a team:")
+        lines += [line(s["name"]) for s in loose] or ["  - none"]
+        lines.append("Channels:")
+        lines += [f"- #{c['name']}: {c['topic'] or ''} (members: {', '.join(store.members(conn, c['name']))})"
+                  for c in store.open_channels(conn)] or ["- none"]
+        open_reqs = conn.execute("SELECT * FROM requests WHERE status IN ('pending','escalated')").fetchall()
+        lines.append("Open requests:")
+        lines += [org.describe(r) + f" [{r['status']}]" for r in open_reqs] or ["- none"]
+    return "\n".join(lines)
+
+
+def create_team(name: str, charter: str, repos: list[str], topic: str = "", supervisor: str = "") -> str:
+    """Create a team for a project or domain and start its supervisor.
+
+    charter: what the team owns, its goals and anything the human specified. The supervisor keeps it.
+    repos: the folders the team works in (the supervisor can read them). supervisor: its session name
+    (default '<name>-sup'). The team gets a Discord category, a desk channel for talking to the
+    supervisor, and a team channel.
+    """
+    with store.db() as conn:
+        _lead(conn)
+        err, sup = org.create_team(conn, name, charter, repos, topic, supervisor or None)
+        if err:
+            return err
+        t = store.get_team(conn, name.lower())
+        cmd, cwd = launch.supervisor_command(t["name"], sup, json.loads(t["repos"]))
+    code, text = launch.run(cmd, cwd=cwd)
+    if code != 0:
+        return f"Team registered, but the supervisor didn't start:\n{text}"
+    return f"Team '{t['name']}' created. Its supervisor '{sup}' is starting and will introduce itself."
+
+
+def join_team(session: str, team: str) -> str:
+    """Put an existing session without a team onto a team as a dev. It and its supervisor are told."""
+    with store.db() as conn:
+        _lead(conn)
+        if store.get_team(conn, team) is None:
+            return f"No team '{team}'."
+        if store.session_by_name(conn, session) is None:
+            return f"No session named '{session}'."
+        current = store.team_of(conn, session)
+        if current is not None:
+            return f"'{session}' is already on team '{current['name']}'."
+        org.join_team(conn, team, session)
+    return f"'{session}' joined team '{team}'."
+
+
+def requests() -> str:
+    """Open requests from supervisors, waiting for your decision or the human's."""
+    with store.db() as conn:
+        _lead(conn)
+        rows = conn.execute("SELECT * FROM requests WHERE status IN ('pending','escalated') ORDER BY id").fetchall()
+    return "\n\n".join(org.describe(r) + f"\n[{r['status']}]" for r in rows) or "No open requests."
+
+
+def approve_request(request_id: int, note: str = "") -> str:
+    """Approve a supervisor's request. It's carried out as asked (a spawn starts the dev on that team)."""
+    with store.db() as conn:
+        _lead(conn)
+        msg, cmd, cwd = org.decide(conn, request_id, True, note, by=store.LEAD)
+    if cmd:
+        code, text = launch.run(cmd, cwd=cwd)
+        if code != 0:
+            return f"{msg} But the session didn't start:\n{text}"
+    return msg
+
+
+def reject_request(request_id: int, reason: str) -> str:
+    """Reject a supervisor's request, saying why."""
+    with store.db() as conn:
+        _lead(conn)
+        return org.decide(conn, request_id, False, reason, by=store.LEAD)[0]
+
+
+def escalate_request(request_id: int, note: str) -> str:
+    """Hand a request to the human with Approve/Reject buttons, with your note on it."""
+    with store.db() as conn:
+        lead = _lead(conn)
+        req = org.get_request(conn, request_id)
+        if req is None or req["status"] != "pending":
+            return f"No pending request #{request_id}."
+        conn.execute("UPDATE requests SET status='escalated', note=? WHERE id=?", (note, request_id))
+        store.post(conn, lead["id"], "request_escalated", str(request_id))
+    return f"Request #{request_id} is with the human now."
 
 
 def remove_from_channel(channel: str, sessions: list[str]) -> str:
     """Remove sessions from a group channel. Each is told it was removed."""
     channel = channel.lstrip("#")
     with store.db() as conn:
-        lead = _lead_only(conn)
-        current = store.members(conn, channel)
-        gone = [s for s in sessions if s in current]
+        lead = _lead(conn)
+        gone = [s for s in sessions if s in store.members(conn, channel)]
         conn.executemany("DELETE FROM channel_members WHERE channel=? AND session_name=?",
                          [(channel, s) for s in gone])
-        _notify(conn, lead, gone, f"You've been removed from #{channel}. Don't post there any more.")
+        org.notify(conn, lead["name"], gone, f"You've been removed from #{channel}. Don't post there any more.")
         if gone:
             store.post(conn, lead["id"], "channel_note", f"➖ Removed {', '.join(gone)}.", channel=channel)
     return f"Removed {', '.join(gone) or 'nobody'} from #{channel}."
@@ -307,38 +410,30 @@ def close_channel(channel: str) -> str:
     """Close a group channel. Members are told; the Discord channel is kept read-only for the record."""
     channel = channel.lstrip("#")
     with store.db() as conn:
-        lead = _lead_only(conn)
+        lead = _lead(conn)
         ch = store.get_channel(conn, channel)
         if ch is None or ch["closed"]:
             return f"No open channel #{channel}."
+        if store.get_team(conn, channel):
+            return f"#{channel} is a team's own channel; it stays open while the team exists."
         conn.execute("UPDATE channels SET closed=1 WHERE name=?", (channel,))
-        _notify(conn, lead, store.members(conn, channel), f"#{channel} has been closed. Don't post there any more.")
+        org.notify(conn, lead["name"], store.members(conn, channel),
+                   f"#{channel} has been closed. Don't post there any more.")
         store.post(conn, lead["id"], "channel_closed", "", channel=channel)
     return f"Closed #{channel}."
 
 
-def spawn(directory: str, task: str, name: str) -> str:
-    """Start a new background session in `directory` working on `task`. It joins the fleet as `name`."""
+def emergency_stop(session: str, reason: str) -> str:
+    """Last resort: stop any session right now. Only when something is actively going wrong (a runaway
+    loop, burning tokens, doing damage) and its supervisor can't handle it. The human and the
+    session's supervisor are told. A message later wakes it again."""
+    if not reason.strip():
+        return "Give the reason. The human and the supervisor will see it."
     with store.db() as conn:
-        _lead_only(conn)
-        if store.session_by_name(conn, name) is not None:
-            return f"The name '{name}' is taken. Pick another."
-    if not launch.NAME_RE.match(name) or name == store.LEAD:
-        return "Names can only use letters, digits, - and _ (and not 'thunderhead')."
-    cwd = Path(directory).expanduser()
-    if not cwd.is_dir():
-        return f"{cwd} is not a directory."
-    code, text = launch.run(launch.bg_command(name) + [task], cwd=cwd)
-    return f"Spawned {name} in {cwd}." if code == 0 else f"Spawn failed:\n{text}"
-
-
-def stop_session(name: str) -> str:
-    """Stop a session. Its conversation is kept; a message from you or the human wakes it again."""
-    with store.db() as conn:
-        lead = _lead_only(conn)
-        target = store.session_by_name(conn, name)
+        lead = _lead(conn)
+        target = store.session_by_name(conn, session)
         if target is None or target["status"] in store.DEAD:
-            return f"No running session named '{name}'."
+            return f"No running session named '{session}'."
         if target["id"] == lead["id"]:
             return "You can't stop yourself."
         store.set_status(conn, target["id"], "stopped")
@@ -346,16 +441,23 @@ def stop_session(name: str) -> str:
     if code != 0 and not ("No job matching" in text and target["status"] == store.SLEEPING):
         with store.db() as conn:
             store.set_status(conn, target["id"], target["status"])
-        return f"Couldn't stop {name}:\n{text}"
+        return f"Couldn't stop {session}:\n{text}"
     with store.db() as conn:
-        store.post(conn, target["id"], "stopped", "Stopped by The ThunderHead. Send a message here to start it again.")
-    return f"Stopped {name}."
+        store.post(conn, target["id"], "stopped", f"🚨 Emergency stop by The ThunderHead: {reason}")
+        store.post(conn, lead["id"], "report", f"🚨 I emergency-stopped **{session}**: {reason}")
+        team = store.team_of(conn, session)
+        if team is not None and team["supervisor"] != session:
+            org.notify(conn, lead["name"], [team["supervisor"]],
+                       f"I emergency-stopped your dev '{session}': {reason}. Decide what it should do next "
+                       "before messaging it again (a message wakes it).")
+    return f"Stopped {session}. The human and its supervisor have been told."
 
 
-LEAD_TOOLS = (fleet, create_channel, add_to_channel, remove_from_channel, close_channel, spawn, stop_session)
-if os.environ.get("THUNDERHEAD_ROLE") == "lead":
-    for fn in LEAD_TOOLS:
-        mcp.tool()(fn)
+SUPERVISOR_TOOLS = (create_channel, add_to_channel, request)
+LEAD_TOOLS = (fleet, create_team, join_team, requests, approve_request, reject_request, escalate_request,
+              create_channel, add_to_channel, remove_from_channel, close_channel, emergency_stop)
+for fn in {"lead": LEAD_TOOLS, "supervisor": SUPERVISOR_TOOLS}.get(os.environ.get("THUNDERHEAD_ROLE"), ()):
+    mcp.tool()(fn)
 
 
 def main():

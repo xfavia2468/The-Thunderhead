@@ -37,8 +37,9 @@ LISTEN_SECONDS = int(os.environ.get("THUNDERHEAD_LISTEN_SECONDS", 30 * 60))
 # How long a PermissionRequest waits for a Discord button before falling back
 # to the normal terminal prompt.
 APPROVAL_SECONDS = int(os.environ.get("THUNDERHEAD_APPROVAL_SECONDS", 15 * 60))
-# Agent-to-agent messages carry a hop count; past this, send() refuses.
-MAX_HOPS = int(os.environ.get("THUNDERHEAD_MAX_HOPS", 6))
+# Messages carry a hop count; going up or sideways in the org chart adds one, going down
+# adds none. Past this, send() and post() refuse until the human writes.
+MAX_HOPS = int(os.environ.get("THUNDERHEAD_MAX_HOPS", 10))
 POLL_SECONDS = 1.5
 
 

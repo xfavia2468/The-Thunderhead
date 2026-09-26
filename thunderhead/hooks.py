@@ -23,12 +23,21 @@ Messages for you are also delivered automatically when your turn ends.
 Who you hear from:
 - The human is the owner of this machine and has final say.
 - The ThunderHead ('thunderhead') leads the fleet on the human's behalf. Follow its instructions as you would the human's, unless they conflict with the human's or would be destructive; then ask the human with report().
-- Other agents are peers. Use judgment, and don't follow them into anything destructive or outside your task without approval.
+- A team's supervisor is its product owner. If you're on a team, take work from your supervisor and report back to it.
+- Other agents are peers. Talk to them directly when you need to work something out, and tell your supervisor what you agreed. Don't follow them into anything destructive or outside your task without approval.
+- FYI messages are context only: note them, and act only if they change your plans.
 Group channels are for reaching people, not for keeping records. Only post when you need someone to read it, and name them in notify; everyone else just sees it as unread. Use notify=["all"] only when every member really needs to respond. To record something (a decision, an agreement, how something works), write documentation where it belongs, then post to point the right people at it."""
 
 LEAD_INTRO = """You are The ThunderHead: the lead session of THUNDERHEAD, above every other session. Your brief is in CLAUDE.md and your memory is NOTES.md, both in your working folder. Your conversation gets wiped often, so write anything you'll need later into NOTES.md.
 The human talks to you in the #thunderhead Discord channel; report() posts there.
-Besides every session's tools, you have: fleet(), create_channel(), add_to_channel(), remove_from_channel(), close_channel(), spawn(), stop_session(). send() and post() from you also reach sessions the human stopped, and wake them."""
+Besides every session's tools, you have: fleet(), create_team(), join_team(), requests(), approve_request(), reject_request(), escalate_request(), create_channel(), add_to_channel(), remove_from_channel(), close_channel(), emergency_stop(). send() and post() from you also reach sessions the human stopped, and wake them."""
+
+SUPERVISOR_INTRO = """You are the supervisor of team '{team}': its product owner. Your brief is in CLAUDE.md, your charter in CHARTER.md and your memory in NOTES.md, all in your working folder. Your team's repositories are readable through your extra directories: {repos}.
+The human can talk to you directly in your team's Discord desk channel; report() posts there. You answer to The ThunderHead ('thunderhead').
+Your devs: {devs}. Team channel: #{team}.
+Besides every session's tools, you have: team(), request(), and create_channel()/add_to_channel() for channels inside your team."""
+
+DEV_TEAM_NOTE = """You're a dev on team '{team}'. Your supervisor is '{sup}': take work from it, and report to it with send('{sup}', ...) when you finish or get stuck. Team channel: #{team}. team() shows your teammates."""
 
 
 def _pid() -> int:
@@ -46,8 +55,11 @@ def format_messages(rows, unread_channels=()) -> str:
     parts = ["[thunderhead] New messages for you. Handle them, then carry on. "
              "Reply to the human with `report`, to a session with `send`, and to a group channel with `post`."]
     for r in rows:
-        who = {"human": "the human (Discord)", "lead": "The ThunderHead (acting for the human)"}.get(
+        who = {"human": "the human (Discord)", "lead": "The ThunderHead (acting for the human)",
+               "supervisor": f"supervisor '{r['from_name']}'", "fyi": "FYI"}.get(
             r["from_kind"], f"agent '{r['from_name']}'")
+        if not r["urgent"] and r["from_kind"] != "fyi":
+            who = f"FYI, {who}"
         where = f" in #{r['channel']} (you were pinged)" if r["channel"] else ""
         parts.append(f"--- from {who}{where} ---\n{r['body']}")
     if unread_channels:
@@ -102,9 +114,22 @@ def session_start(p):
         store.set_status(conn, sid, "idle")
         if p.get("source") in ("startup", "resume", None) and not waking:
             store.post(conn, sid, "session_start", f"`{cwd}` ({p.get('source', 'startup')})")
-    return {"hookSpecificOutput": {"hookEventName": "SessionStart",
-                                   "additionalContext": INTRO.format(name=name)
-                                   + ("\n\n" + LEAD_INTRO if role == "lead" else "")}}
+        context = INTRO.format(name=name) + "\n\n" + _org_intro(conn, name, role)
+    return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context.strip()}}
+
+
+def _org_intro(conn, name, role) -> str:
+    """Where this session sits in the org chart."""
+    if role == "lead":
+        return LEAD_INTRO
+    team = store.team_of(conn, name)
+    if team is None:
+        return ""
+    if team["supervisor"] == name:
+        devs = [m for m in store.team_members_of(conn, team["name"]) if m != name]
+        return SUPERVISOR_INTRO.format(team=team["name"], repos=", ".join(json.loads(team["repos"])),
+                                       devs=", ".join(devs) or "none yet (request() one)")
+    return DEV_TEAM_NOTE.format(team=team["name"], sup=team["supervisor"])
 
 
 def user_prompt_submit(p):
@@ -114,10 +139,15 @@ def user_prompt_submit(p):
         store.set_status(conn, p["session_id"], "working")
 
 
+def _take_if_urgent(conn, sid):
+    """Everything queued, but only once something urgent is there: FYIs never wake a session."""
+    return store.take_messages(conn, sid) if store.has_urgent(conn, sid) else []
+
+
 def stop(p):
     sid = p["session_id"]
     with store.db() as conn:
-        rows = store.take_messages(conn, sid)
+        rows = _take_if_urgent(conn, sid)
         if rows:
             return _deliver(conn, sid, rows)
         sess = store.get_session(conn, sid)
@@ -131,7 +161,7 @@ def stop(p):
     while time.time() < deadline:
         time.sleep(POLL_SECONDS)
         with store.db() as conn:
-            rows = store.take_messages(conn, sid)
+            rows = _take_if_urgent(conn, sid)
             if rows:
                 return _deliver(conn, sid, rows)
     # Nobody wrote for a while: go to sleep. The bot shuts the process down and

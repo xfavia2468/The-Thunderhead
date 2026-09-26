@@ -99,6 +99,38 @@ CREATE TABLE IF NOT EXISTS channel_reads (
     last_id      INTEGER NOT NULL,
     PRIMARY KEY (channel, session_name)
 );
+
+-- Teams: a supervisor (the product owner) plus its dev sessions. By session name.
+CREATE TABLE IF NOT EXISTS teams (
+    name            TEXT PRIMARY KEY,
+    topic           TEXT DEFAULT '',
+    repos           TEXT NOT NULL,      -- JSON list of folders the team works in
+    supervisor      TEXT NOT NULL,
+    category_id     INTEGER,            -- Discord category for the team
+    desk_id         INTEGER,            -- Discord channel for talking to the supervisor
+    created_at      REAL
+);
+CREATE TABLE IF NOT EXISTS team_members (
+    team         TEXT NOT NULL,
+    session_name TEXT NOT NULL UNIQUE,  -- a session is on at most one team
+    added_at     REAL,
+    PRIMARY KEY (team, session_name)
+);
+
+-- Things a supervisor asked The ThunderHead to do.
+CREATE TABLE IF NOT EXISTS requests (
+    id          INTEGER PRIMARY KEY,
+    from_name   TEXT NOT NULL,
+    team        TEXT NOT NULL,
+    action      TEXT NOT NULL,          -- spawn | channel | other
+    params      TEXT NOT NULL,          -- JSON
+    reason      TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',  -- pending | escalated | approved | rejected | failed
+    note        TEXT DEFAULT '',
+    message_id  INTEGER,                -- Discord message with the human's buttons, once escalated
+    created_at  REAL,
+    decided_at  REAL
+);
 """
 
 # Columns added after the first release. Each runs once; "duplicate column" means done.
@@ -106,6 +138,9 @@ MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN role TEXT DEFAULT 'worker'",
     "ALTER TABLE messages ADD COLUMN channel TEXT",
     "ALTER TABLE outbox ADD COLUMN channel TEXT",
+    # 0 = FYI: delivered with the next real message, never wakes the session on its own.
+    "ALTER TABLE messages ADD COLUMN urgent INTEGER DEFAULT 1",
+    "ALTER TABLE channels ADD COLUMN team TEXT",  # set for a team's own channels
 ]
 
 # The lead session: its name, and the role that unlocks its tools.
@@ -208,18 +243,27 @@ def set_status(conn, sid, status, summary=None):
 
 # --- messages ---------------------------------------------------------------
 
-def queue_message(conn, to_session, from_kind, from_name, body, hops=0, channel=None):
-    """from_kind is 'human', 'lead' (The ThunderHead) or 'agent'."""
+def queue_message(conn, to_session, from_kind, from_name, body, hops=0, channel=None, urgent=True):
+    """from_kind is 'human', 'lead' (The ThunderHead), 'supervisor' or 'agent'.
+
+    urgent=False makes it an FYI: it rides along with the next urgent message.
+    """
     conn.execute(
-        "INSERT INTO messages (to_session, from_kind, from_name, body, hops, channel, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)", (to_session, from_kind, from_name, body, hops, channel, now()))
+        "INSERT INTO messages (to_session, from_kind, from_name, body, hops, channel, urgent, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (to_session, from_kind, from_name, body, hops, channel, int(urgent), now()))
+
+
+def has_urgent(conn, sid) -> bool:
+    return conn.execute("SELECT 1 FROM messages WHERE to_session=? AND delivered_at IS NULL AND urgent=1",
+                        (sid,)).fetchone() is not None
 
 
 def take_messages(conn, sid):
     """Atomically claim every undelivered message for a session."""
     rows = conn.execute(
         "UPDATE messages SET delivered_at=? WHERE to_session=? AND delivered_at IS NULL "
-        "RETURNING id, from_kind, from_name, body, hops, channel", (now(), sid)).fetchall()
+        "RETURNING id, from_kind, from_name, body, hops, channel, urgent", (now(), sid)).fetchall()
     return sorted(rows, key=lambda r: r["id"])
 
 
@@ -256,7 +300,7 @@ def decide_approval(conn, approval_id, decision) -> bool:
 
 CHANNEL_RE = r"^[a-z0-9][a-z0-9-]{0,39}$"
 # Discord channels the bot already uses.
-RESERVED_CHANNELS = ("fleet", "needs-you", "agent-chatter", LEAD)
+RESERVED_CHANNELS = ("fleet", "needs-you", "agent-chatter", LEAD, "groups")
 
 
 def get_channel(conn, name):
@@ -328,6 +372,49 @@ def read_log(conn, channel, session_name, limit=20):
 def recent_posts(conn, channel, seconds=60) -> int:
     return conn.execute("SELECT COUNT(*) FROM outbox WHERE kind='channel_post' AND channel=? AND created_at>?",
                         (channel, now() - seconds)).fetchone()[0]
+
+
+# --- teams ------------------------------------------------------------------
+
+def get_team(conn, name):
+    return conn.execute("SELECT * FROM teams WHERE name=?", (name,)).fetchone()
+
+
+def team_of(conn, session_name):
+    """The team this session is on (as supervisor or dev), or None."""
+    return conn.execute("SELECT t.* FROM teams t JOIN team_members m ON m.team=t.name "
+                        "WHERE m.session_name=?", (session_name,)).fetchone()
+
+
+def team_members_of(conn, team) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "SELECT session_name FROM team_members WHERE team=? ORDER BY added_at", (team,))]
+
+
+def all_teams(conn):
+    return conn.execute("SELECT * FROM teams ORDER BY created_at").fetchall()
+
+
+def add_team_member(conn, team, session_name):
+    conn.execute("INSERT OR REPLACE INTO team_members (team, session_name, added_at) VALUES (?, ?, ?)",
+                 (team, session_name, now()))
+
+
+def rank(conn, session_name) -> tuple[str, str | None]:
+    """(role, team) where role is lead, supervisor, dev or unteamed."""
+    if session_name == LEAD:
+        return "lead", None
+    team = team_of(conn, session_name)
+    if team is None:
+        return "unteamed", None
+    return ("supervisor" if team["supervisor"] == session_name else "dev"), team["name"]
+
+
+def is_down(conn, sender, recipient) -> bool:
+    """True when a message goes down the org chart: from the lead, or from a supervisor to its own dev."""
+    s_role, s_team = rank(conn, sender)
+    r_role, r_team = rank(conn, recipient)
+    return s_role == "lead" or (s_role == "supervisor" and r_team == s_team and r_role == "dev")
 
 
 # --- kv ---------------------------------------------------------------------

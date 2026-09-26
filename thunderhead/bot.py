@@ -15,9 +15,10 @@ from discord import app_commands
 from discord.ext import tasks
 
 from . import db as store
+from . import launch, org
 from .config import MEMORY_ROOT, MEMORY_SNAPSHOT_SECONDS, ROOT, SETTINGS_FILE
 from .hooks import _hops_after, delivery
-from .launch import NAME_RE, bg_command, lead_command
+from .launch import NAME_RE, bg_command, lead_command, relaunch_command
 
 log = logging.getLogger("thunderhead")
 
@@ -94,6 +95,37 @@ class ApprovalButton(discord.ui.DynamicItem[discord.ui.Button],
             content=f"{interaction.message.content}\n**{outcome}**", view=None)
 
 
+class RequestButton(discord.ui.DynamicItem[discord.ui.Button],
+                    template=r"th:req:(?P<action>approve|reject):(?P<id>[0-9]+)"):
+    """Approve/Reject for a supervisor's request that The ThunderHead escalated to the human."""
+
+    def __init__(self, action: str, request_id: int):
+        super().__init__(discord.ui.Button(
+            label="Approve" if action == "approve" else "Reject",
+            style=discord.ButtonStyle.success if action == "approve" else discord.ButtonStyle.danger,
+            custom_id=f"th:req:{action}:{request_id}"))
+        self.action, self.request_id = action, request_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["action"], int(match["id"]))
+
+    async def interaction_check(self, interaction) -> bool:
+        if not is_owner(interaction.user):
+            await interaction.response.send_message("Only the fleet owner can answer.", ephemeral=True)
+            return False
+        return True
+
+    async def callback(self, interaction: discord.Interaction):
+        with store.db() as conn:
+            msg, cmd, cwd = org.decide(conn, self.request_id, self.action == "approve", "", by="human")
+        if cmd:
+            code, text = await run_claude(cmd, cwd=cwd)
+            if code != 0:
+                msg += f" But the session didn't start: {text[-300:]}"
+        await interaction.response.edit_message(content=f"{interaction.message.content}\n**{msg}**", view=None)
+
+
 def approval_view(approval_id: int) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(ApprovalButton("allow", approval_id))
@@ -115,7 +147,7 @@ class Thunderhead(discord.Client):
         self.wake_failed: dict[str, float] = {}  # session id -> time of last failed wake
 
     async def setup_hook(self):
-        self.add_dynamic_items(ApprovalButton)
+        self.add_dynamic_items(ApprovalButton, RequestButton)
         guild = discord.Object(GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
@@ -147,6 +179,12 @@ class Thunderhead(discord.Client):
             if sess["thread_id"] != ch.id:
                 conn.execute("UPDATE sessions SET thread_id=? WHERE name=?", (ch.id, sess["name"]))
             return ch
+        team = store.team_of(conn, sess["name"])
+        if team is not None and team["supervisor"] == sess["name"]:
+            ch = await self.team_desk(conn, team["name"])
+            if sess["thread_id"] != ch.id:
+                conn.execute("UPDATE sessions SET thread_id=? WHERE name=?", (ch.id, sess["name"]))
+            return ch
         if sess["thread_id"]:
             ch = self.get_channel(sess["thread_id"])
             if ch is None:
@@ -156,7 +194,9 @@ class Thunderhead(discord.Client):
                     ch = None
             if ch is not None:
                 return ch
-        starter = await self.channels[FLEET].send(f"🆕 **{sess['name']}** · `{sess['cwd']}`")
+        # Devs get their thread in their team's channel; everyone else in #fleet.
+        parent = await self.group_channel(conn, team["name"]) if team is not None else self.channels[FLEET]
+        starter = await parent.send(f"🆕 **{sess['name']}** · `{sess['cwd']}`")
         thread = await starter.create_thread(name=sess["name"][:100], auto_archive_duration=10080)
         conn.execute("UPDATE sessions SET thread_id=? WHERE name=?", (thread.id, sess["name"]))
         return thread
@@ -194,6 +234,26 @@ class Thunderhead(discord.Client):
                     pass
                 conn.execute("UPDATE approvals SET closed=1 WHERE id=?", (ap["id"],))
 
+    async def team_category(self, conn, team: str) -> discord.CategoryChannel:
+        t = store.get_team(conn, team)
+        cat = self.get_channel(t["category_id"]) if t["category_id"] else None
+        if cat is None:
+            cat = discord.utils.get(self.guild.categories, name=team) or await self.guild.create_category(team)
+            conn.execute("UPDATE teams SET category_id=? WHERE name=?", (cat.id, team))
+        return cat
+
+    async def team_desk(self, conn, team: str) -> discord.TextChannel:
+        """The channel where the human talks to a team's supervisor, like #thunderhead for the lead."""
+        t = store.get_team(conn, team)
+        desk = self.get_channel(t["desk_id"]) if t["desk_id"] else None
+        if desk is None:
+            cat = await self.team_category(conn, team)
+            name = f"{team}-supervisor"
+            desk = discord.utils.get(cat.text_channels, name=name) or await self.guild.create_text_channel(
+                name, category=cat, topic=f"Talk to {t['supervisor']}, the supervisor of team {team}.")
+            conn.execute("UPDATE teams SET desk_id=? WHERE name=?", (desk.id, team))
+        return desk
+
     async def group_channel(self, conn, name) -> discord.TextChannel:
         """The Discord channel for a group channel, created on first use."""
         ch_row = store.get_channel(conn, name)
@@ -201,8 +261,11 @@ class Thunderhead(discord.Client):
             ch = self.get_channel(ch_row["discord_id"])
             if ch is not None:
                 return ch
-        category = discord.utils.get(self.guild.categories, name=GROUPS) \
-            or await self.guild.create_category(GROUPS)
+        if ch_row["team"]:
+            category = await self.team_category(conn, ch_row["team"])
+        else:
+            category = discord.utils.get(self.guild.categories, name=GROUPS) \
+                or await self.guild.create_category(GROUPS)
         ch = discord.utils.get(category.text_channels, name=name) \
             or await self.guild.create_text_channel(name, category=category, topic=ch_row["topic"] or None)
         conn.execute("UPDATE channels SET discord_id=? WHERE name=?", (ch.id, name))
@@ -212,7 +275,15 @@ class Thunderhead(discord.Client):
         ch = await self.group_channel(conn, ev["channel"])
         kind, body = ev["kind"], ev["body"]
         who = sess["name"] if sess else "?"
-        if kind == "channel_created":
+        if kind == "team_created":
+            t = store.get_team(conn, ev["channel"])
+            desk = await self.team_desk(conn, t["name"])
+            await ch.send(f"👥 Team **{t['name']}** channel: its supervisor **{t['supervisor']}** and devs work "
+                          f"together here. Devs' threads live here too. Talk to the supervisor in {desk.mention}.")
+            await desk.send(f"👥 Team **{t['name']}** was created by The ThunderHead. Its supervisor "
+                            f"**{t['supervisor']}** is starting up and will introduce itself here.\n"
+                            f"Repos: {', '.join(f'`{r}`' for r in json.loads(t['repos']))}")
+        elif kind == "channel_created":
             row = store.get_channel(conn, ev["channel"])
             await ch.send(f"📣 **#{ev['channel']}** was created by The ThunderHead."
                           + (f"\nTopic: {row['topic']}" if row["topic"] else "") + f"\n{body}\n"
@@ -234,6 +305,16 @@ class Thunderhead(discord.Client):
             return
         thread = await self.thread_for(conn, sess)
         kind, body = ev["kind"], ev["body"]
+        if kind == "request_escalated":
+            req = org.get_request(conn, int(body))
+            view = discord.ui.View(timeout=None)
+            view.add_item(RequestButton("approve", req["id"]))
+            view.add_item(RequestButton("reject", req["id"]))
+            msg = await self.channels[LEAD_CHANNEL].send(
+                f"<@{OWNER_ID}> 📋 The ThunderHead wants your call on a request:\n```\n{org.describe(req)[:1400]}\n```"
+                + (f"ThunderHead's note: {req['note']}" if req["note"] else ""), view=view)
+            conn.execute("UPDATE requests SET message_id=? WHERE id=?", (msg.id, req["id"]))
+            return
         if kind == "report":
             await send_long(thread, body)
         elif kind == "status":
@@ -266,11 +347,16 @@ class Thunderhead(discord.Client):
                 "OR (status='stopped' AND updated_at > ?) "
                 f"ORDER BY status IN {store.DEAD}, created_at",
                 (time.time() - 3600, time.time() - 86400)).fetchall()
-            lines = []
+            lines, seen = [], set()
             for s in rows:
+                if s["name"] in seen or store.session_by_name(conn, s["name"])["id"] != s["id"]:
+                    continue  # older rows of a resumed session
+                seen.add(s["name"])
+                role, team = store.rank(conn, s["name"])
+                tag = {"lead": " 👑", "supervisor": f" [{team} · supervisor]", "dev": f" [{team}]"}.get(role, "")
                 where = f" · <#{s['thread_id']}>" if s["thread_id"] else ""
                 summary = f" — {s['summary']}" if s["summary"] else ""
-                lines.append(f"{ICONS.get(s['status'], '❔')} **{s['name']}** `{s['status']}`{summary}{where}")
+                lines.append(f"{ICONS.get(s['status'], '❔')} **{s['name']}**{tag} `{s['status']}`{summary}{where}")
             text = "**⚡ THUNDERHEAD fleet**\n" + ("\n".join(lines) or "*No sessions yet.*")
             if text == self.last_board:
                 return
@@ -309,7 +395,7 @@ class Thunderhead(discord.Client):
             # session id -> (oldest undelivered message time, whether any is from the human)
             mail = {r[0]: (r[1], bool(r[2])) for r in conn.execute(
                 "SELECT to_session, MIN(created_at), MAX(from_kind IN ('human', 'lead')) FROM messages "
-                "WHERE delivered_at IS NULL GROUP BY to_session")}
+                "WHERE delivered_at IS NULL AND urgent=1 GROUP BY to_session")}
 
             for s in store.live_sessions(conn):
                 if s["id"] in self.waking:
@@ -387,6 +473,7 @@ class Thunderhead(discord.Client):
                 if not rows:
                     return
                 text_for = delivery(conn, sid, rows)
+                relaunch_cmd = relaunch_command(conn, sess, resume=sid)
                 store.set_status(conn, sid, "waking")
             if not Path(sess["cwd"] or "").is_dir():
                 code, text = 1, f"its folder `{sess['cwd']}` no longer exists."
@@ -394,7 +481,7 @@ class Thunderhead(discord.Client):
                 # Fails harmlessly when the process has already exited.
                 await run_claude(["claude", "stop", short_id(sid)])
                 code, text = await run_claude(
-                    bg_command(sess["name"], resume=sid, role=sess["role"]) + [text_for], cwd=sess["cwd"])
+                    relaunch_cmd + [text_for], cwd=sess["cwd"])
             with store.db() as conn:
                 if code == 0:
                     self.wake_failed.pop(sid, None)
@@ -426,7 +513,8 @@ class Thunderhead(discord.Client):
             elif isinstance(channel, discord.Thread):
                 sess = store.session_by_thread(conn, channel.id)
             else:
-                sess = None
+                desk = conn.execute("SELECT supervisor FROM teams WHERE desk_id=?", (channel.id,)).fetchone()
+                sess = store.session_by_name(conn, desk["supervisor"]) if desk else None
             if sess is None and group is None and channel.id != self.channels[LEAD_CHANNEL].id:
                 return
             if not is_owner(message.author):
@@ -444,6 +532,7 @@ class Thunderhead(discord.Client):
             else:
                 store.queue_message(conn, sess["id"], "human", message.author.display_name, message.content)
                 targets = [sess]
+                self.copy_up(conn, sess["name"], message.content)
         if targets is None:
             await self.start_lead(first_message=message.content)
             await message.add_reaction("⚡")
@@ -451,6 +540,16 @@ class Thunderhead(discord.Client):
         await message.add_reaction("📨")
         for t in targets:
             await self.deliver_now(t, message if group is None else None)
+
+    def copy_up(self, conn, name, text):
+        """When the human goes around a level, tell the level they skipped (as an FYI, not a task),
+        so its picture of the team doesn't go stale."""
+        role, team = store.rank(conn, name)
+        if role == "supervisor":
+            org.fyi(conn, store.LEAD, f"The human messaged {name} (supervisor of {team}) directly: {text[:1500]}")
+        elif role == "dev":
+            sup = store.get_team(conn, team)["supervisor"]
+            org.fyi(conn, sup, f"The human messaged your dev {name} directly: {text[:1500]}")
 
     async def start_lead(self, first_message: str | None = None) -> tuple[int, str]:
         """Start a fresh ThunderHead: no earlier conversation, memory from hq/NOTES.md."""
@@ -519,6 +618,12 @@ async def session_names(interaction, current: str):
     return [app_commands.Choice(name=n, value=n) for n in names if current.lower() in n.lower()][:25]
 
 
+async def team_names(interaction, current: str):
+    with store.db() as conn:
+        names = [t["name"] for t in store.all_teams(conn)]
+    return [app_commands.Choice(name=n, value=n) for n in names if current.lower() in n.lower()][:25]
+
+
 async def owner_only(interaction) -> bool:
     if not is_owner(interaction.user):
         await interaction.response.send_message("Only the fleet owner can do that.", ephemeral=True)
@@ -553,11 +658,14 @@ async def send(interaction: discord.Interaction, session: str, message: str):
 
 @bot.tree.command(description="Start a new background Claude session")
 @app_commands.describe(directory="Working directory (absolute or ~/...)", task="What the session should do",
-                       name="Session name (letters, digits, - and _)", mode="Permission mode")
+                       name="Session name (letters, digits, - and _)", mode="Permission mode",
+                       team="Put it on this team as a dev, reporting to the team's supervisor")
 @app_commands.choices(mode=[app_commands.Choice(name=m, value=m)
                             for m in ("default", "acceptEdits", "auto", "plan")])
+@app_commands.autocomplete(team=team_names)
 async def spawn(interaction: discord.Interaction, directory: str, task: str,
-                name: str | None = None, mode: app_commands.Choice[str] | None = None):
+                name: str | None = None, mode: app_commands.Choice[str] | None = None,
+                team: str | None = None):
     if not await owner_only(interaction):
         return
     cwd = Path(directory).expanduser()
@@ -571,14 +679,32 @@ async def spawn(interaction: discord.Interaction, directory: str, task: str,
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    cmd = bg_command(name)
+    if team:
+        with store.db() as conn:
+            if store.get_team(conn, team) is None:
+                await interaction.followup.send(f"No team `{team}`.", ephemeral=True)
+                return
+            err, cmd, _ = org.spawn_dev(conn, team, str(cwd), task, name)
+            if not err:
+                org.fyi(conn, store.get_team(conn, team)["supervisor"],
+                        f"The human spawned '{name}' onto your team with this task: {task[:1000]}")
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+        prompt = cmd.pop()
+    else:
+        cmd, prompt = bg_command(name), task
     if mode and mode.value != "default":
         cmd += ["--permission-mode", mode.value]
-    code, text = await run_claude(cmd + [task], cwd=cwd)
+    code, text = await run_claude(cmd + [prompt], cwd=cwd)
     if code != 0:
+        if team:
+            with store.db() as conn:
+                org.undo_spawn(conn, team, name)
         await interaction.followup.send(f"Spawn failed:\n```\n{text}\n```", ephemeral=True)
         return
-    await interaction.followup.send(f"🚀 Spawned **{name}** in `{cwd}`. Its thread appears in #{FLEET} "
+    where = f"team {team}'s channel" if team else f"#{FLEET}"
+    await interaction.followup.send(f"🚀 Spawned **{name}** in `{cwd}`. Its thread appears in {where} "
                                     f"once it starts.\n```\n{text}\n```", ephemeral=True)
 
 
