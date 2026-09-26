@@ -14,7 +14,7 @@ from discord import app_commands
 from discord.ext import tasks
 
 from . import db as store
-from .config import ROOT, SETTINGS_FILE
+from .config import MEMORY_ROOT, MEMORY_SNAPSHOT_SECONDS, ROOT, SETTINGS_FILE
 from .hooks import _hops_after, format_messages
 from .launch import NAME_RE, bg_command, lead_command
 
@@ -134,7 +134,7 @@ class Thunderhead(discord.Client):
             self.channels[name] = ch
         self.guild = guild
         log.info("Logged in as %s; watching %s", self.user, guild.name)
-        for loop in (self.pump, self.board, self.liveness):
+        for loop in (self.pump, self.board, self.liveness, self.snapshot_memory):
             if not loop.is_running():
                 loop.start()
 
@@ -353,6 +353,19 @@ class Thunderhead(discord.Client):
             await run_claude(["claude", "stop", short_id(s["id"])])
         for s in to_wake:
             asyncio.create_task(self.wake(s))
+
+    @tasks.loop(seconds=MEMORY_SNAPSHOT_SECONDS)
+    async def snapshot_memory(self):
+        """Commit whatever the lead sessions changed in the memory repo, so notes have history."""
+        if not (MEMORY_ROOT / ".git").exists():
+            return
+        git = ["git", "-C", str(MEMORY_ROOT)]
+        await run_claude(git + ["add", "-A"])
+        code, _ = await run_claude(git + ["diff", "--cached", "--quiet"])
+        if code != 0:  # something is staged
+            code, text = await run_claude(git + ["commit", "-q", "-m", "Memory snapshot"])
+            if code != 0:
+                log.warning("Memory snapshot failed: %s", text)
 
     async def wake(self, sess):
         """Resume a session in the background with its queued messages as the prompt.

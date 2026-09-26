@@ -75,10 +75,12 @@ The ThunderHead is the lead session, and it outranks every other session. Tell i
 
 Hop limits still apply to it, and it asks you before anything costly or destructive.
 
-It runs in `hq/`. Its conversation gets wiped (`/wipe`), so it keeps its memory in files:
+Its conversation gets wiped (`/wipe`), so it keeps what it needs in files:
 
-- `hq/CLAUDE.md`: its standing brief (role, powers, rules). It's in git. Edit it to change how The ThunderHead behaves.
-- `hq/NOTES.md`: its own notebook. It reads it at every start and writes down anything worth keeping. It isn't tracked by git.
+- `briefs/thunderhead.md` (this repo): its standing brief (role, powers, rules). Edit it to change how The ThunderHead behaves. It's copied into its working folder at every start.
+- `~/thunderhead-memory/hq/NOTES.md`: its own notebook. It reads it at every start and writes down anything worth keeping.
+
+`~/thunderhead-memory/` is a separate, local-only git repo for the fleet's memory (set `THUNDERHEAD_MEMORY` to move it). The bot commits a snapshot every 10 minutes when something changed, so you can see how notes evolved and roll back if a lead session garbles them. Claude Code has to trust that folder before it will start sessions there: run `claude` in it once and accept the prompt.
 
 ## Group channels
 

@@ -24,6 +24,13 @@ _load_dotenv()
 
 DB_PATH = Path(os.environ.get("THUNDERHEAD_DB", ROOT / "data" / "thunderhead.db"))
 
+# Briefs (how each kind of lead session behaves) are code and live here, versioned
+# with it. Memory (notes, team charters) is state, written by agents, and lives in
+# its own git repo. The bot snapshots that repo; agents never commit to it.
+BRIEFS = ROOT / "briefs"
+MEMORY_ROOT = Path(os.environ.get("THUNDERHEAD_MEMORY", Path.home() / "thunderhead-memory")).expanduser()
+MEMORY_SNAPSHOT_SECONDS = int(os.environ.get("THUNDERHEAD_MEMORY_SNAPSHOT_SECONDS", 10 * 60))
+
 # How long a listening session's Stop hook waits for a message before the
 # session goes to sleep. The bot then shuts it down and wakes it on the next message.
 LISTEN_SECONDS = int(os.environ.get("THUNDERHEAD_LISTEN_SECONDS", 30 * 60))

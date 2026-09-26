@@ -9,7 +9,8 @@ Discord control plane for a fleet of Claude Code sessions. See README.md for wha
 - `thunderhead/mcp_server.py`: tools each session gets (`status`, `report`, `send`, ...).
 - `thunderhead/bot.py`: Discord bot. Posts the outbox, writes your messages into `messages`, wakes and reaps sessions.
 - `hook.py`, `mcp_server.py`, `bot.py`: thin entry points. `setup_config.py` generates `config/*.json`.
-- `hq/`: working folder of The ThunderHead, the lead session. `hq/CLAUDE.md` is its standing brief.
+- `briefs/`: standing briefs for lead sessions (`thunderhead.md`, ...). The launcher copies a brief into the session's working folder as its CLAUDE.md at every start.
+- Memory lives outside this repo in `~/thunderhead-memory/` (`THUNDERHEAD_MEMORY`), a separate git repo the bot snapshots every 10 minutes: `hq/NOTES.md` is The ThunderHead's notebook. Don't commit memory here.
 
 ## Working on this repo
 

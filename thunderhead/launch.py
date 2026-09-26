@@ -4,11 +4,15 @@ import re
 import subprocess
 
 from . import db as store
-from .config import MCP_FILE, ROOT, SETTINGS_FILE
+from .config import BRIEFS, MCP_FILE, MEMORY_ROOT, SETTINGS_FILE
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
-HQ = ROOT / "hq"
+HQ = MEMORY_ROOT / "hq"
 NOTES = HQ / "NOTES.md"
+
+GENERATED = ("<!-- Generated from {src} each time this session starts. "
+             "Edit that file in the THUNDERHEAD repo, not this copy. -->\n\n")
+MEMORY_GITIGNORE = "# Generated copies of the briefs in the THUNDERHEAD repo\nCLAUDE.md\n"
 
 LEAD_BOOT = """[thunderhead] You are The ThunderHead, starting fresh. Your earlier conversation was wiped.
 Read NOTES.md now: it's your memory. Then call fleet() to see the current state, post a two-line \
@@ -53,9 +57,28 @@ def bg_command(name: str, resume: str | None = None, role: str = "worker") -> li
     return cmd + ["-n", name, "--settings", json.dumps(settings), f"--mcp-config={MCP_FILE}"]
 
 
+def ensure_memory() -> None:
+    """Create the memory repo on first use."""
+    MEMORY_ROOT.mkdir(parents=True, exist_ok=True)
+    if not (MEMORY_ROOT / ".git").exists():
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=MEMORY_ROOT, check=True)
+        (MEMORY_ROOT / ".gitignore").write_text(MEMORY_GITIGNORE)
+        (MEMORY_ROOT / "README.md").write_text(
+            "# THUNDERHEAD memory\n\nNotes and team charters written by the fleet's lead sessions. "
+            "The THUNDERHEAD bot commits snapshots here; roll back with git if notes get garbled.\n")
+
+
+def install_brief(folder, brief: str) -> None:
+    """Write the brief as the folder's CLAUDE.md, so Claude Code loads it for a session working there."""
+    src = BRIEFS / brief
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "CLAUDE.md").write_text(GENERATED.format(src=src) + src.read_text())
+
+
 def lead_command(first_message: str | None = None) -> tuple[list[str], str]:
     """A fresh ThunderHead session: (command, working directory)."""
-    HQ.mkdir(exist_ok=True)
+    ensure_memory()
+    install_brief(HQ, "thunderhead.md")
     if not NOTES.exists():
         NOTES.write_text(NOTES_TEMPLATE)
     prompt = LEAD_BOOT + (f"\n\n--- from the human (Discord) ---\n{first_message}" if first_message else "")
