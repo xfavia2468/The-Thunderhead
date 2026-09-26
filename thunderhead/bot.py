@@ -962,6 +962,50 @@ async def spawn(interaction: discord.Interaction, directory: str, task: str,
                                     f"once it starts.{extra}\n```\n{text}\n```", ephemeral=True)
 
 
+@bot.tree.command(name="archive", description="Done with a conversation: file its thread away and let the session sleep")
+@app_commands.describe(session="The session (leave empty inside its thread)")
+@app_commands.autocomplete(session=session_names)
+async def archive_cmd(interaction: discord.Interaction, session: str | None = None):
+    if not await owner_only(interaction):
+        return
+    with store.db() as conn:
+        if session:
+            sess = store.session_by_name(conn, session)
+        elif isinstance(interaction.channel, discord.Thread):
+            sess = store.session_by_thread(conn, interaction.channel.id)
+        else:
+            sess = None
+        role = store.rank(conn, sess["name"])[0] if sess else None
+    if sess is None:
+        await interaction.response.send_message(
+            "Name a session, or run /archive inside its thread.", ephemeral=True)
+        return
+    if role in ("lead", "supervisor"):
+        await interaction.response.send_message(
+            f"**{sess['name']}** lives in a channel, not a thread, and Discord can't archive channels.",
+            ephemeral=True)
+        return
+    if sess["status"] in ("working", "needs_you", "waking"):
+        await interaction.response.send_message(
+            f"**{sess['name']}** is `{sess['status']}` right now. Let it finish, or /stop it if you mean to "
+            "interrupt it.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    running = sess["status"] not in store.DEAD and sess["status"] != store.SLEEPING
+    if running:
+        # Asleep, not stopped: anyone can still wake it with a message. SessionEnd stays quiet for sleepers.
+        with store.db() as conn:
+            store.set_status(conn, sess["id"], store.SLEEPING)
+        info = await agent_info(sess["id"])
+        if info and info.get("kind") == "background":
+            await run_claude(["claude", "stop", short_id(sess["id"])])
+    with store.db() as conn:
+        thread = await bot.thread_for(conn, sess)
+    await thread.send("🗄️ Archived by you. A message here, or from another session, wakes it again.")
+    await bot.archive(thread)
+    await interaction.followup.send(f"🗄️ Archived **{sess['name']}**. It's listed in #{ARCHIVED}.", ephemeral=True)
+
+
 class ConfirmDelete(discord.ui.View):
     def __init__(self, name: str, keep_thread: bool):
         super().__init__(timeout=120)

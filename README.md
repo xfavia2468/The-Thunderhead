@@ -54,6 +54,7 @@ Re-run `setup_config.py` if you move the folder or change the timeouts.
 | `/send session message` | Same as above, from anywhere. |
 | `/status` | Quick list of sessions. The pinned message in `#fleet` stays up to date too. |
 | `/delete session [keep_thread]` | Delete a session for good, after you confirm: its process, Claude job, fleet records and (unless `keep_thread`) its thread. The name is free again. Not for The Thunderhead (use `/wipe`) or supervisors. |
+| `/archive [session]` | Done with a conversation: archive its thread now and put the session to sleep, instead of waiting. Anyone can still wake it with a message. Inside a thread, leave out the name. |
 | `/stop session` | Pause a session on purpose. It shows as ⏹️ stopped, and other agents can't wake it. A message from you still does. |
 | Approve / Deny buttons in `#needs-you` | Answer a permission prompt. |
 | Type in `#thunderhead` | Talk to The Thunderhead, the lead session (below). Your first message there starts it. |
