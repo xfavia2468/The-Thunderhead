@@ -940,8 +940,9 @@ async def spawn(interaction: discord.Interaction, directory: str, task: str,
     if not await owner_only(interaction):
         return
     cwd = Path(directory).expanduser()
-    if not cwd.is_dir():
-        await interaction.response.send_message(f"`{cwd}` is not a directory.", ephemeral=True)
+    if not cwd.is_dir() or launch.forbidden_dir(cwd):
+        await interaction.response.send_message(launch.forbidden_dir(cwd) or f"`{cwd}` is not a directory.",
+                                                ephemeral=True)
         return
     name = name or f"{cwd.name or 'root'}-{secrets.token_hex(2)}"
     if not NAME_RE.match(name) or name == store.LEAD:

@@ -279,16 +279,25 @@ def propose_charter(text: str, summary: str) -> str:
         return org.propose_charter(conn, me, text, summary)
 
 
-def request(action: str, details: dict, reason: str) -> str:
+def request(action: str, details: dict, reason: str, replaces: int = 0) -> str:
     """Ask The Thunderhead to do something only it can do. It approves, rejects, or asks the human.
 
-    action: "spawn" (details: directory, task, name) for a new dev on your team, "channel"
+    action: "spawn" (details: task, name, and directory: the product repo to work in, or leave it
+    out for a fresh empty workspace; never your own folder) for a new dev on your team, "channel"
     (details: name, members, topic) for a channel with other teams' sessions, or "other"
     (details: anything) for everything else. reason: why the team needs it.
+    replaces: the number of an earlier request of yours that this one supersedes; it's withdrawn.
     """
     with store.db() as conn:
         me, _, _ = _require(conn, "supervisor")
-        return org.create_request(conn, me, action, details, reason)
+        return org.create_request(conn, me, action, details, reason, replaces)
+
+
+def withdraw_request(request_id: int, reason: str) -> str:
+    """Take back one of your requests that hasn't been decided yet (plans changed, it crossed with news)."""
+    with store.db() as conn:
+        me, _, _ = _require(conn, "supervisor")
+        return org.withdraw_request(conn, me, request_id, reason)
 
 
 # --- The Thunderhead only ---------------------------------------------------
@@ -331,7 +340,8 @@ def fleet() -> str:
     return "\n".join(lines)
 
 
-def create_team(name: str, charter: str, repos: list[str], topic: str = "", supervisor: str = "") -> str:
+def create_team(name: str, charter: str, repos: list[str], topic: str = "", supervisor: str = "",
+                autonomy: str = "", max_devs: int = -1) -> str:
     """Create a team for a project or domain and start its supervisor.
 
     charter: a first draft of the team's mandate: what it owns (and doesn't), goals, definition of
@@ -340,6 +350,8 @@ def create_team(name: str, charter: str, repos: list[str], topic: str = "", supe
     repos: the folders the team works in (the supervisor can read them). supervisor: its session name
     (default '<name>-sup'). The team gets a Discord category, a desk channel for talking to the
     supervisor, and a team channel.
+    autonomy ("propose" or "act") and max_devs (default 3): set them here if the human said, rather
+    than writing them into the charter. Giving more room than the defaults goes to the human's buttons.
     """
     with store.db() as conn:
         _lead(conn)
@@ -347,16 +359,23 @@ def create_team(name: str, charter: str, repos: list[str], topic: str = "", supe
         if err:
             return err
         t = store.get_team(conn, name.lower())
+        settings_note = ""
+        if autonomy or max_devs >= 0:
+            lead = _lead(conn)
+            settings_note = " " + org.request_config(conn, lead, t["name"], {
+                "autonomy": autonomy or None, "max_devs": max_devs if max_devs >= 0 else None},
+                "set when the team was created")
+            t = store.get_team(conn, t["name"])
         cmd, cwd = launch.supervisor_command(t)
     code, text = launch.run(cmd, cwd=cwd)
     if code != 0:
         return f"Team registered, but the supervisor didn't start:\n{text}"
-    return f"Team '{t['name']}' created. Its supervisor '{sup}' is starting and will introduce itself."
+    return f"Team '{t['name']}' created. Its supervisor '{sup}' is starting and will introduce itself.{settings_note}"
 
 
 def spawn_oneoff(directory: str, task: str, name: str = "") -> str:
     """Start a one-off session outside any team for a small, self-contained job that no team owns and
-    that won't need follow-up. It reports its result to you and is deleted automatically once done
+    that won't need follow-up. directory: the folder it works in, or "" for a fresh empty workspace. It reports its result to you and is deleted automatically once done
     (its thread stays as the record). At most a couple can run at once. Anything that belongs to a
     team's product, or is ongoing, goes to that team's supervisor instead.
     """
@@ -502,7 +521,7 @@ def emergency_stop(session: str, reason: str) -> str:
     return f"Stopped {session}. The human and its supervisor have been told."
 
 
-SUPERVISOR_TOOLS = (create_channel, add_to_channel, request, propose_charter)
+SUPERVISOR_TOOLS = (create_channel, add_to_channel, request, withdraw_request, propose_charter)
 LEAD_TOOLS = (fleet, create_team, spawn_oneoff, join_team, set_team_config, requests, approve_request, reject_request, escalate_request,
               create_channel, add_to_channel, remove_from_channel, close_channel, emergency_stop)
 for fn in {"lead": LEAD_TOOLS, "supervisor": SUPERVISOR_TOOLS}.get(os.environ.get("THUNDERHEAD_ROLE"), ()):

@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 from . import db as store
-from .config import BRIEFS, MCP_FILE, MEMORY_ROOT, SETTINGS_FILE
+from .config import BRIEFS, MCP_FILE, MEMORY_ROOT, SETTINGS_FILE, WORKSPACES
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 HQ = MEMORY_ROOT / "hq"
@@ -109,10 +109,33 @@ Your memory across wipes and restarts. Keep it current: rewrite stale parts inst
 
 
 def _allow_edits(settings, *paths: Path) -> None:
-    """Let a lead session edit its own notes without an approval prompt."""
-    for p in paths:
-        rule = f"//{p.as_posix().lstrip('/')}"
-        settings["permissions"]["allow"] += [f"Edit({rule})", f"Write({rule})"]
+    """Let a lead session edit its own notes without an approval prompt.
+
+    Edit(...) rules cover every file-editing tool, Write included; `//` marks an absolute path.
+    The memory repo is a git checkout, where Claude Code makes background sessions edit in a
+    worktree. A worktree copy of notes would be lost, and lead sessions never edit the same
+    files, so the guard is off for them.
+    """
+    settings["permissions"]["allow"] += [f"Edit(//{p.as_posix().lstrip('/')})" for p in paths]
+    settings["worktree"] = {"bgIsolation": "none"}
+
+
+def workspace_dir(name: str) -> Path:
+    """An empty working folder of the session's own, for work that has no repository."""
+    folder = WORKSPACES / name
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def forbidden_dir(directory: Path) -> str | None:
+    """Folders sessions mustn't work in: the memory repo holds lead sessions' briefs, which
+    Claude Code would load for anyone working there."""
+    d = directory.expanduser().resolve()
+    if d == MEMORY_ROOT.resolve() or MEMORY_ROOT.resolve() in d.parents:
+        return (f"{d} is inside the fleet's memory folder, where sessions would load a supervisor's or "
+                "The Thunderhead's brief. Use the product's repository, or leave directory empty for a "
+                "fresh workspace.")
+    return None
 
 
 def team_folder(team: str) -> Path:

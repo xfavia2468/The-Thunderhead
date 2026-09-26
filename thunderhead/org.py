@@ -157,14 +157,23 @@ def join_team(conn, team: str, session_name: str):
 
 
 def spawn_dev(conn, team: str, directory: str, task: str, name: str) -> tuple[str | None, list[str], str]:
-    """Validate and register a new dev. Returns (error, command, folder); the caller runs the command."""
+    """Validate and register a new dev. Returns (error, command, folder); the caller runs the command.
+
+    An empty directory gives the dev a fresh workspace of its own.
+    """
     if not launch.NAME_RE.match(name) or name == store.LEAD:
         return "Names can only use letters, digits, - and _ (and not 'thunderhead').", [], ""
     if store.session_by_name(conn, name) is not None:
         return f"The name '{name}' is taken.", [], ""
-    cwd = Path(directory).expanduser()
-    if not cwd.is_dir():
-        return f"{cwd} is not a directory.", [], ""
+    if directory:
+        cwd = Path(directory).expanduser()
+        err = launch.forbidden_dir(cwd)
+        if err:
+            return err, [], ""
+        if not cwd.is_dir():
+            return f"{cwd} is not a directory.", [], ""
+    else:
+        cwd = launch.workspace_dir(name)
     t = store.get_team(conn, team)
     if store.dev_count(conn, team) >= t["max_devs"]:
         return f"Team '{team}' is at its limit of {t['max_devs']} devs.", [], ""
@@ -196,9 +205,15 @@ Your task:
 
 def spawn_oneoff(conn, lead, directory: str, task: str, name: str = "") -> tuple[str | None, list[str], str, str]:
     """Validate and register a one-off for The Thunderhead. Returns (error, command, folder, name)."""
-    cwd = Path(directory).expanduser()
-    if not cwd.is_dir():
-        return f"{cwd} is not a directory.", [], "", ""
+    if directory:
+        cwd = Path(directory).expanduser()
+        err = launch.forbidden_dir(cwd)
+        if err:
+            return err, [], "", ""
+        if not cwd.is_dir():
+            return f"{cwd} is not a directory.", [], "", ""
+    else:
+        cwd = None  # a workspace, once the name is settled
     if not task.strip():
         return "Give the task.", [], "", ""
     name = name or f"oneoff-{secrets.token_hex(2)}"
@@ -211,6 +226,7 @@ def spawn_oneoff(conn, lead, directory: str, task: str, name: str = "") -> tuple
     err = ceiling_error(conn)
     if err:
         return err, [], "", ""
+    cwd = cwd or launch.workspace_dir(name)
     conn.execute("INSERT INTO oneoffs (name, by_lead) VALUES (?, 1)", (name,))
     store.post(conn, lead["id"], "report", f"🧩 Started one-off **{name}** in `{cwd}`: {task[:300]}")
     return None, launch.bg_command(name) + [ONEOFF_BRIEF.format(task=task)], str(cwd), name
@@ -263,18 +279,37 @@ def describe(req) -> str:
     return f"#{req['id']} from {req['from_name']} (team {req['team']}): {req['action']}({body})\nWhy: {req['reason']}"
 
 
-def create_request(conn, me, action: str, params: dict, reason: str) -> str:
+def withdraw_request(conn, me, req_id: int, reason: str) -> str:
+    """A supervisor taking back one of its own requests before it's decided."""
+    req = get_request(conn, req_id)
+    if req is None or req["from_name"] != me["name"]:
+        return f"#{req_id} isn't one of your requests."
+    if req["status"] not in ("pending", "escalated"):
+        return f"#{req_id} is already {req['status']}."
+    conn.execute("UPDATE requests SET status='withdrawn', note=?, decided_at=? WHERE id=?",
+                 (reason, store.now(), req_id))
+    fyi(conn, store.LEAD, f"{me['name']} withdrew request #{req_id} ({req['action']}): {reason}")
+    return f"Withdrew request #{req_id}."
+
+
+def create_request(conn, me, action: str, params: dict, reason: str, replaces: int = 0) -> str:
     team = store.team_of(conn, me["name"])
     if team is None or team["supervisor"] != me["name"]:
         return "Only a team's supervisor can make requests."
+    if replaces:
+        result = withdraw_request(conn, me, replaces, "replaced by a new request")
+        if not result.startswith("Withdrew"):
+            return f"Can't replace #{replaces}: {result}"
     if action not in REQUEST_ACTIONS:
         return f"action must be one of {', '.join(REQUEST_ACTIONS)}."
     if not reason.strip():
         return "Say why: The Thunderhead needs a reason to approve it."
-    need = {"spawn": ("directory", "task", "name"), "channel": ("name", "members")}.get(action, ())
+    need = {"spawn": ("task", "name"), "channel": ("name", "members")}.get(action, ())
     missing = [k for k in need if not params.get(k)]
     if missing:
         return f"A {action} request needs: {', '.join(missing)}."
+    if action == "spawn" and params.get("directory") and launch.forbidden_dir(Path(params["directory"])):
+        return launch.forbidden_dir(Path(params["directory"]))
     if action == "spawn" and store.dev_count(conn, team["name"]) >= team["max_devs"]:
         return (f"Your team is at its limit of {team['max_devs']} devs. If it really needs more, ask The "
                 "Thunderhead to raise the limit (request('other', ...) with your reason), or free up a dev.")
@@ -284,10 +319,12 @@ def create_request(conn, me, action: str, params: dict, reason: str) -> str:
     req = conn.execute("SELECT * FROM requests WHERE id=?", (cur.lastrowid,)).fetchone()
     lead = store.session_by_name(conn, store.LEAD)
     if lead is not None:
+        replaced = f"\nThis replaces request #{replaces}, which is withdrawn." if replaces else ""
         store.queue_message(conn, lead["id"], "supervisor", me["name"],
-                            f"New request {describe(req)}\n\nDecide with approve_request({req['id']}), "
+                            f"New request {describe(req)}{replaced}\n\nDecide with approve_request({req['id']}), "
                             f"reject_request({req['id']}, why) or escalate_request({req['id']}, note).", hops=1)
-    return f"Request #{req['id']} sent to The Thunderhead. You'll hear back when it's decided."
+    note = f" (replaces #{replaces})" if replaces else ""
+    return f"Request #{req['id']}{note} sent to The Thunderhead. You'll hear back when it's decided."
 
 
 def get_request(conn, req_id):
@@ -314,7 +351,7 @@ def decide(conn, req_id: int, approve: bool, note: str, by: str) -> tuple[str, l
         result = "The charter is now in force; the supervisor loads it at its next start."
     if approve:
         if req["action"] == "spawn":
-            err, cmd, cwd = spawn_dev(conn, req["team"], params["directory"], params["task"], params["name"])
+            err, cmd, cwd = spawn_dev(conn, req["team"], params.get("directory", ""), params["task"], params["name"])
             if err:
                 approve, note = False, f"{note} (couldn't do it: {err})".strip()
         elif req["action"] == "channel":

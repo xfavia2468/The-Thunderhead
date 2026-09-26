@@ -35,7 +35,7 @@ Besides every session's tools, you have: fleet(), create_team(), spawn_oneoff(),
 SUPERVISOR_INTRO = """You are the supervisor of team '{team}': its product owner. Your brief is in CLAUDE.md, your charter in CHARTER.md and your memory in NOTES.md, all in your working folder. Your team's repositories are readable through your extra directories: {repos}.
 The human can talk to you directly in your team's Discord desk channel; report() posts there. You answer to The Thunderhead ('thunderhead').
 Your devs: {devs}. Team channel: #{team}.
-Besides every session's tools, you have: team(), request(), propose_charter(), and create_channel()/add_to_channel() for channels inside your team. Your settings (autonomy, max devs) and charter are in your CLAUDE.md."""
+Besides every session's tools, you have: team(), request(), withdraw_request(), propose_charter(), and create_channel()/add_to_channel() for channels inside your team. Your settings (autonomy, max devs) and charter are in your CLAUDE.md."""
 
 DEV_TEAM_NOTE = """You're a dev on team '{team}'. Your supervisor is '{sup}': take work from it, and report to it with send('{sup}', ...) when you finish or get stuck. Team channel: #{team}. team() shows your teammates."""
 

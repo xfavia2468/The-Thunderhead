@@ -29,6 +29,9 @@ DB_PATH = Path(os.environ.get("THUNDERHEAD_DB", ROOT / "data" / "thunderhead.db"
 # its own git repo. The bot snapshots that repo; agents never commit to it.
 BRIEFS = ROOT / "briefs"
 MEMORY_ROOT = Path(os.environ.get("THUNDERHEAD_MEMORY", Path.home() / "thunderhead-memory")).expanduser()
+# Empty working folders for devs and one-offs with no repository to work in. It must be outside
+# any repo or folder with a CLAUDE.md, so they load nobody else's brief.
+WORKSPACES = Path(os.environ.get("THUNDERHEAD_WORKSPACES", Path.home() / "thunderhead-workspaces")).expanduser()
 MEMORY_SNAPSHOT_SECONDS = int(os.environ.get("THUNDERHEAD_MEMORY_SNAPSHOT_SECONDS", 10 * 60))
 
 # How long a listening session's Stop hook waits for a message before the
