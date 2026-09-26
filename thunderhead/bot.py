@@ -126,6 +126,34 @@ class RequestButton(discord.ui.DynamicItem[discord.ui.Button],
         await interaction.response.edit_message(content=f"{interaction.message.content}\n**{msg}**", view=None)
 
 
+class AckButton(discord.ui.DynamicItem[discord.ui.Button], template=r"th:ack"):
+    """Acknowledge: deletes a notice so the channel stays clean. Threads started from it survive."""
+
+    def __init__(self):
+        super().__init__(discord.ui.Button(label="Acknowledge", style=discord.ButtonStyle.secondary,
+                                           emoji="✔️", custom_id="th:ack"))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls()
+
+    async def interaction_check(self, interaction) -> bool:
+        if not is_owner(interaction.user):
+            await interaction.response.send_message("Only the fleet owner can do that.", ephemeral=True)
+            return False
+        return True
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        await interaction.message.delete()
+
+
+def ack_view() -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(AckButton())
+    return view
+
+
 def approval_view(approval_id: int) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(ApprovalButton("allow", approval_id))
@@ -147,7 +175,7 @@ class Thunderhead(discord.Client):
         self.wake_failed: dict[str, float] = {}  # session id -> time of last failed wake
 
     async def setup_hook(self):
-        self.add_dynamic_items(ApprovalButton, RequestButton)
+        self.add_dynamic_items(ApprovalButton, RequestButton, AckButton)
         guild = discord.Object(GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
@@ -167,6 +195,7 @@ class Thunderhead(discord.Client):
             self.channels[name] = ch
         self.guild = guild
         log.info("Logged in as %s; watching %s", self.user, guild.name)
+        await self.tidy_fleet()
         for loop in (self.pump, self.board, self.liveness, self.snapshot_memory):
             if not loop.is_running():
                 loop.start()
@@ -196,7 +225,7 @@ class Thunderhead(discord.Client):
                 return ch
         # Devs get their thread in their team's channel; everyone else in #fleet.
         parent = await self.group_channel(conn, team["name"]) if team is not None else self.channels[FLEET]
-        starter = await parent.send(f"🆕 **{sess['name']}** · `{sess['cwd']}`")
+        starter = await parent.send(f"🆕 **{sess['name']}** · `{sess['cwd']}`", view=ack_view())
         thread = await starter.create_thread(name=sess["name"][:100], auto_archive_duration=10080)
         conn.execute("UPDATE sessions SET thread_id=? WHERE name=?", (thread.id, sess["name"]))
         return thread
@@ -509,7 +538,31 @@ class Thunderhead(discord.Client):
 
     # -- your messages --
 
+    async def tidy_fleet(self):
+        """Once at startup: add Acknowledge to older session notices, and clear pin notices,
+        so #fleet is just the board."""
+        with store.db() as conn:
+            board_id = store.kv_get(conn, "board_message_id")
+            team_ids = [r[0] for r in conn.execute(
+                "SELECT discord_id FROM channels WHERE team IS NOT NULL AND discord_id IS NOT NULL")]
+        channels = [self.channels[FLEET]] + [ch for ch in map(self.get_channel, team_ids) if ch]
+        for ch in channels:
+            async for msg in ch.history(limit=200):
+                try:
+                    if msg.type == discord.MessageType.pins_add and msg.author == self.user:
+                        await msg.delete()
+                    elif (msg.author == self.user and str(msg.id) != board_id
+                          and msg.content.startswith("🆕") and not msg.components):
+                        await msg.edit(view=ack_view())
+                except discord.HTTPException:
+                    log.warning("Couldn't tidy message %s in #%s", msg.id, ch.name)
+
     async def on_message(self, message: discord.Message):
+        # The board is pinned in #fleet; the "pinned a message" notice is clutter.
+        if (message.type == discord.MessageType.pins_add and message.author == self.user
+                and message.channel.id == self.channels.get(FLEET, message.channel).id):
+            await message.delete()
+            return
         if message.author.bot or message.guild is None:
             return
         channel = message.channel
