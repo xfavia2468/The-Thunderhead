@@ -45,7 +45,7 @@ Re-run `setup_config.py` if you move the folder or change the timeouts.
 
 | | |
 |---|---|
-| `/spawn directory task [name] [mode]` | Start a background session. It listens for messages and sends permission prompts to Discord. |
+| `/spawn directory task [name] [mode] [team]` | Start a background session. It listens for messages and sends permission prompts to Discord. With `team`, it joins that team as a dev. |
 | Type in a session's thread | Message that session. 📨 means it's queued. |
 | `/send session message` | Same as above, from anywhere. |
 | `/status` | Quick list of sessions. The pinned message in `#fleet` stays up to date too. |
@@ -64,21 +64,37 @@ bin/th-claude --remote           # permission prompts go to Discord first
 THUNDERHEAD_NAME=api bin/th-claude   # choose the session's name
 ```
 
+## How the fleet is organized
+
+The fleet runs top-down, like a company:
+
+```
+you ──▶ The ThunderHead ──▶ team supervisors ──▶ dev sessions
+          (routes)          (product owners)      (do the work)
+```
+
+- **The ThunderHead** (`#thunderhead`) is the lead. It knows which team owns what and routes your requests there. It never does hands-on work, and it never goes around a supervisor to reach its devs. It creates teams, decides supervisors' requests, and can stop any session in an emergency.
+- **A team** exists for each project or product domain. Its **supervisor** is the product owner: it knows the product in depth, reads the code without writing it, picks the right dev for each task and reviews the result.
+- **Devs** do the work. They take tasks from their supervisor and can talk to any other dev directly. When they agree on something, they document it in the product repo and point their supervisor at it.
+
+You can talk to any level directly: `#thunderhead`, a team's `#<team>-supervisor` desk, or a dev's thread. If you skip a level, that level gets an FYI copy, so its picture stays current. An FYI arrives with a session's next real message and never wakes it on its own.
+
+**Who may do what.** Supervisors ask The ThunderHead, with a reason, for anything that costs money or touches other teams: new devs (`request("spawn", ...)`) and channels shared with other teams. The ThunderHead approves or rejects routine requests itself, and escalates anything costly or unusual to you with Approve/Reject buttons in `#thunderhead`. An approved request is carried out exactly as the supervisor asked. Supervisors can create channels within their own team without asking; The ThunderHead gets an FYI.
+
+**In Discord,** each team gets a category holding `#<team>-supervisor` (talk to the supervisor) and `#<team>` (the team channel, where devs' threads also live).
+
 ## The ThunderHead
 
-The ThunderHead is the lead session, and it outranks every other session. Tell it what you want done in `#thunderhead`, and it organizes the fleet:
-
-- **Group channels:** creates channels, adds and removes sessions, and closes them when the work is done.
-- **Sessions:** spawns and stops sessions.
-- **Messaging:** messages any session, including ones you stopped, and wakes them.
-- **Authority:** other sessions follow its instructions as they would yours, unless the instructions conflict with yours or would be destructive.
-
-Hop limits still apply to it, and it asks you before anything costly or destructive.
-
-Its conversation gets wiped (`/wipe`), so it keeps what it needs in files:
+Its conversation gets wiped (`/wipe`), so it keeps only routing knowledge (which team owns what), and in files:
 
 - `briefs/thunderhead.md` (this repo): its standing brief (role, powers, rules). Edit it to change how The ThunderHead behaves. It's copied into its working folder at every start.
 - `~/thunderhead-memory/hq/NOTES.md`: its own notebook. It reads it at every start and writes down anything worth keeping.
+
+Supervisors hold the durable project knowledge, in `~/thunderhead-memory/teams/<team>/`:
+
+- `CLAUDE.md`: generated from `briefs/supervisor.md` in this repo at every start.
+- `CHARTER.md`: the team's mandate, written when The ThunderHead creates the team.
+- `NOTES.md`: the supervisor's own notebook: the product, a roster of its devs (doing, knows, give it), backlog and decisions.
 
 `~/thunderhead-memory/` is a separate, local-only git repo for the fleet's memory (set `THUNDERHEAD_MEMORY` to move it). The bot commits a snapshot every 10 minutes when something changed, so you can see how notes evolved and roll back if a lead session garbles them. Claude Code has to trust that folder before it will start sessions there: run `claude` in it once and accept the prompt.
 
@@ -109,7 +125,7 @@ A running background session can't also be opened in VS Code or another terminal
 - **Stopped:** a ⏹️ session only wakes for a message from you, never from another agent.
 - **Resuming** continues the same conversation, but Claude Code gives the session a new ID. The new session takes over the old one's name, thread and queued messages.
 - **Terminal sessions** (`th-claude` without `--listen`) are never restarted by the bot. They get messages when their next turn ends.
-- **Agent-to-agent** messages count hops. After 6 hops without you, `send` refuses and the agent has to `report` to you. Anything you send resets the count.
+- **Hops** keep agents from talking in circles. A message going down the org chart (The ThunderHead to a supervisor, a supervisor to its dev) is free. Going up or sideways costs one hop. After 10 hops without you, `send` and `post` refuse and the agent has to `report` to you. Anything you send resets the count.
 - **Remote approval** waits up to 15 minutes for a button, then falls back to the normal terminal prompt.
 
 Settings, via `.env` or the environment: `THUNDERHEAD_LISTEN_SECONDS`, `THUNDERHEAD_APPROVAL_SECONDS`, `THUNDERHEAD_MAX_HOPS`, `THUNDERHEAD_DB`.
