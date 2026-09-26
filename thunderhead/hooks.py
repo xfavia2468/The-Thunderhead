@@ -200,14 +200,15 @@ def permission_request(p):
     while time.time() < deadline:
         time.sleep(POLL_SECONDS)
         with store.db() as conn:
-            row = conn.execute("SELECT status FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            row = conn.execute("SELECT status, reason FROM approvals WHERE id=?", (approval_id,)).fetchone()
             if row["status"] == "pending":
                 continue
             store.set_status(conn, sid, "working")
             if row["status"] == "allow":
                 decision = {"behavior": "allow"}
             else:
-                decision = {"behavior": "deny", "message": "Denied by the human from Discord."}
+                why = f" Their reason: {row['reason']}" if row["reason"] else ""
+                decision = {"behavior": "deny", "message": f"Denied by the human from Discord.{why}"}
             return {"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": decision}}
 
     # No answer: expire the buttons and fall back to the normal prompt.

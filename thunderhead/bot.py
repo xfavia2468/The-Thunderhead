@@ -1,6 +1,5 @@
 """Discord bot: posts fleet activity to Discord and carries your messages back into sessions."""
 import asyncio
-import io
 import json
 import logging
 import os
@@ -15,7 +14,8 @@ from discord import app_commands
 from discord.ext import tasks
 
 from . import db as store
-from . import launch, org
+from . import launch, look, org
+from . import config
 from .config import MEMORY_ROOT, MEMORY_SNAPSHOT_SECONDS, ROOT, SETTINGS_FILE
 from .hooks import _hops_after, delivery
 from .launch import NAME_RE, bg_command, lead_command, relaunch_command
@@ -28,102 +28,151 @@ OWNER_ID = int(os.environ.get("DISCORD_OWNER_ID", "0") or 0)
 
 FLEET, NEEDS_YOU, CHATTER, LEAD_CHANNEL, ARCHIVED = "fleet", "needs-you", "agent-chatter", store.LEAD, "archived"
 GROUPS = "groups"  # Discord category that holds the group channels
-ICONS = {"starting": "⏳", "working": "🟢", "listening": "🔵", "idle": "⚪",
-         "needs_you": "🔴", "waking": "⏰", "sleeping": "💤", "stopped": "⏹️", "ended": "⚫", "gone": "⚫"}
-MSG_LIMIT = 1900
+ICONS = look.ICONS
 # A quiet thread (say, a sleeping session's) drops out of the sidebar after a day. It's archived, not
 # deleted: board links still open it, and it comes back as soon as the session posts again.
 THREAD_ARCHIVE_MINUTES = 1440
 
 
-def chunks(text: str, limit: int = MSG_LIMIT):
-    """Split text into Discord-sized pieces, preferring line breaks."""
-    while len(text) > limit:
-        cut = text.rfind("\n", 0, limit)
-        cut = cut if cut > limit // 2 else limit
-        yield text[:cut]
-        text = text[cut:].lstrip("\n")
-    if text:
-        yield text
-
-
-async def send_long(channel, text: str, prefix: str = ""):
-    text = prefix + text
-    if len(text) > 4 * MSG_LIMIT:
-        # Too long to read in chat: preview plus the full text as a file.
-        await channel.send(text[:1500] + "\n… *(full text attached)*",
-                           file=discord.File(io.BytesIO(text.encode()), filename="message.md"))
-        return
-    for part in chunks(text):
-        await channel.send(part)
-
-
 def board_pages(lines: list[str]) -> list[str]:
-    """Split the board into Discord-sized messages at line boundaries. The first has the title."""
-    pages, page = [], "**⚡ THUNDERHEAD fleet**"
+    """Split the board into embed-sized pages at line boundaries."""
+    pages, page = [], ""
     for line in lines or ["*No sessions yet.*"]:
-        line = line[:MSG_LIMIT - 40]
-        if len(page) + 1 + len(line) > MSG_LIMIT:
+        line = line[:look.DESC_LIMIT - 40]
+        if page and len(page) + 1 + len(line) > look.DESC_LIMIT:
             pages.append(page)
-            page = "**⚡ THUNDERHEAD fleet** (continued)"
-        page += "\n" + line
+            page = ""
+        page += ("\n" if page else "") + line
     return pages + [page]
+
+
+def board_embed(page: str, count: int) -> discord.Embed:
+    return look.card(page, title="⚡ THUNDERHEAD fleet", color=look.BOARD,
+                     footer=f"{count} session{'s' if count != 1 else ''} · archived ones are in #archived · updated")
 
 
 def is_owner(user) -> bool:
     return user.id == OWNER_ID
 
 
-# --- approval buttons -------------------------------------------------------
+# --- buttons and modals -----------------------------------------------------
+# Buttons are dynamic items: their state lives in the custom_id, so they keep working after the
+# bot restarts. Modals are pop-up forms, used where the human would otherwise have to type a
+# command or couldn't say why.
 
-class ApprovalButton(discord.ui.DynamicItem[discord.ui.Button],
-                     template=r"th:(?P<action>allow|deny):(?P<id>[0-9]+)"):
-    """Approve/Deny button. Dynamic so it keeps working after the bot restarts."""
+class OwnerOnly:
+    async def interaction_check(self, interaction) -> bool:
+        if not is_owner(interaction.user):
+            await interaction.response.send_message("Only the fleet owner can do that.", ephemeral=True)
+            return False
+        return True
+
+
+def _text(label: str, *, paragraph=False, required=True, default=None, placeholder=None, max_length=4000):
+    return discord.ui.Label(text=label, component=discord.ui.TextInput(
+        style=discord.TextStyle.paragraph if paragraph else discord.TextStyle.short,
+        required=required, default=default, placeholder=placeholder, max_length=max_length))
+
+
+async def finish_approval(interaction: discord.Interaction, approval_id: int, action: str, reason: str = ""):
+    """Record the human's answer to a permission prompt. It leaves #needs-you, since it no longer
+    needs them, and the outcome goes to the session's thread."""
+    with store.db() as conn:
+        ok = store.decide_approval(conn, approval_id, action, reason)
+        if ok:
+            conn.execute("UPDATE approvals SET closed=1 WHERE id=?", (approval_id,))
+    if not ok:
+        await interaction.response.send_message("Already answered or expired.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    if interaction.message:
+        await interaction.message.delete()
+    bot_ = interaction.client
+    with store.db() as conn:
+        ap = conn.execute("SELECT * FROM approvals WHERE id=?", (approval_id,)).fetchone()
+        sess = store.get_session(conn, ap["session_id"])
+        thread = await bot_.thread_for(conn, sess)
+    approved = action == "allow"
+    await thread.send(embed=look.card(
+        f"```json\n{ap['tool_input'][:1500]}\n```",
+        title=f"{'✅ Approved' if approved else '⛔ Denied'} · {ap['tool_name']}",
+        color=look.GOOD if approved else look.BAD,
+        fields=[("Your reason", reason)] if reason else ()))
+
+
+class DenyReasonModal(OwnerOnly, discord.ui.Modal, title="Deny, with a reason"):
+    reason = _text("Why? The session sees this, so it can adjust", paragraph=True, max_length=1000,
+                   placeholder="e.g. Don't touch the production config; use the staging one.")
+
+    def __init__(self, approval_id: int):
+        super().__init__()
+        self.approval_id = approval_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await finish_approval(interaction, self.approval_id, "deny", self.reason.component.value.strip())
+
+
+class ApprovalButton(OwnerOnly, discord.ui.DynamicItem[discord.ui.Button],
+                     template=r"th:(?P<action>allow|deny|why):(?P<id>[0-9]+)"):
+    """Approve / Deny / Deny with reason on a permission prompt."""
+    LOOK = {"allow": ("Approve", discord.ButtonStyle.success, "✅"),
+            "deny": ("Deny", discord.ButtonStyle.danger, "⛔"),
+            "why": ("Deny with reason…", discord.ButtonStyle.secondary, "✍️")}
 
     def __init__(self, action: str, approval_id: int):
-        super().__init__(discord.ui.Button(
-            label="Approve" if action == "allow" else "Deny",
-            style=discord.ButtonStyle.success if action == "allow" else discord.ButtonStyle.danger,
-            custom_id=f"th:{action}:{approval_id}"))
+        label, style, emoji = self.LOOK[action]
+        super().__init__(discord.ui.Button(label=label, style=style, emoji=emoji,
+                                           custom_id=f"th:{action}:{approval_id}"))
         self.action, self.approval_id = action, approval_id
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match):
         return cls(match["action"], int(match["id"]))
 
-    async def interaction_check(self, interaction) -> bool:
-        if not is_owner(interaction.user):
-            await interaction.response.send_message("Only the fleet owner can answer.", ephemeral=True)
-            return False
-        return True
-
     async def callback(self, interaction: discord.Interaction):
-        with store.db() as conn:
-            ok = store.decide_approval(conn, self.approval_id, self.action)
-            if ok:
-                conn.execute("UPDATE approvals SET closed=1 WHERE id=?", (self.approval_id,))
-        if not ok:
-            await interaction.response.send_message("Already answered or expired.", ephemeral=True)
-            return
-        outcome = "✅ Approved" if self.action == "allow" else "⛔ Denied"
-        # Answered: it no longer needs you, so it leaves #needs-you and the outcome goes to the thread.
-        await interaction.response.defer()
-        await interaction.message.delete()
-        bot_ = interaction.client
-        with store.db() as conn:
-            ap = conn.execute("SELECT * FROM approvals WHERE id=?", (self.approval_id,)).fetchone()
-            sess = store.get_session(conn, ap["session_id"])
-            thread = await bot_.thread_for(conn, sess)
-        await thread.send(f"🔐 {outcome}: **{ap['tool_name']}**\n```json\n{ap['tool_input'][:1500]}\n```")
+        if self.action == "why":
+            await interaction.response.send_modal(DenyReasonModal(self.approval_id))
+        else:
+            await finish_approval(interaction, self.approval_id, self.action)
 
 
-class RequestButton(discord.ui.DynamicItem[discord.ui.Button],
+async def finish_request(interaction: discord.Interaction, request_id: int, approve: bool, note: str = ""):
+    """The human's decision on an escalated request: carry it out, and show the outcome on its card."""
+    await interaction.response.defer()
+    with store.db() as conn:
+        msg, cmd, cwd = org.decide(conn, request_id, approve, note, by="human")
+    if cmd:
+        code, text = await run_claude(cmd, cwd=cwd)
+        if code != 0:
+            msg += f" But the session didn't start: {text[-300:]}"
+    decided = approve and "approved" in msg
+    embed = interaction.message.embeds[0] if interaction.message.embeds else look.card()
+    embed.color = look.GOOD if decided else look.BAD
+    embed.add_field(name="✅ Your decision" if decided else "⛔ Your decision",
+                    value=(msg + (f"\nYour note: {note}" if note else ""))[:1024], inline=False)
+    await interaction.message.edit(embed=embed, view=None)
+
+
+class RejectModal(OwnerOnly, discord.ui.Modal, title="Reject, with feedback"):
+    note = _text("What's wrong, or what should change?", paragraph=True, required=False, max_length=1000)
+
+    def __init__(self, request_id: int, charter: bool):
+        super().__init__(title="Request changes to the charter" if charter else "Reject, with feedback")
+        self.request_id = request_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await finish_request(interaction, self.request_id, False, self.note.component.value.strip())
+
+
+class RequestButton(OwnerOnly, discord.ui.DynamicItem[discord.ui.Button],
                     template=r"th:req:(?P<action>approve|reject):(?P<id>[0-9]+)"):
-    """Approve/Reject for a supervisor's request that The Thunderhead escalated to the human."""
+    """Approve / Reject on a request escalated to the human. Reject asks for feedback."""
 
-    def __init__(self, action: str, request_id: int):
+    def __init__(self, action: str, request_id: int, charter: bool = False):
+        label = ("Approve" if action == "approve" else
+                 "Request changes…" if charter else "Reject…")
         super().__init__(discord.ui.Button(
-            label="Approve" if action == "approve" else "Reject",
+            label=label, emoji="✅" if action == "approve" else "✍️",
             style=discord.ButtonStyle.success if action == "approve" else discord.ButtonStyle.danger,
             custom_id=f"th:req:{action}:{request_id}"))
         self.action, self.request_id = action, request_id
@@ -132,23 +181,45 @@ class RequestButton(discord.ui.DynamicItem[discord.ui.Button],
     async def from_custom_id(cls, interaction, item, match):
         return cls(match["action"], int(match["id"]))
 
-    async def interaction_check(self, interaction) -> bool:
-        if not is_owner(interaction.user):
-            await interaction.response.send_message("Only the fleet owner can answer.", ephemeral=True)
-            return False
-        return True
+    async def callback(self, interaction: discord.Interaction):
+        if self.action == "approve":
+            await finish_request(interaction, self.request_id, True)
+            return
+        with store.db() as conn:
+            req = org.get_request(conn, self.request_id)
+        await interaction.response.send_modal(RejectModal(self.request_id, charter=bool(req and req["action"] == "charter")))
+
+
+class ReplyModal(OwnerOnly, discord.ui.Modal, title="Reply"):
+    message = _text("Message", paragraph=True, placeholder="It's delivered when the session's turn ends, "
+                                                          "or wakes it if it's asleep.")
+
+    def __init__(self, session: str):
+        super().__init__(title=f"Message {session}"[:45])
+        self.session = session
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await send_to_session(interaction, self.session, self.message.component.value)
+
+
+class ReplyButton(OwnerOnly, discord.ui.DynamicItem[discord.ui.Button],
+                  template=r"th:reply:(?P<name>[A-Za-z0-9_-]+)"):
+    """Reply to a session straight from a notice, in a pop-up form."""
+
+    def __init__(self, name: str):
+        super().__init__(discord.ui.Button(label="Reply", emoji="💬", style=discord.ButtonStyle.primary,
+                                           custom_id=f"th:reply:{name}"))
+        self.name = name
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["name"])
 
     async def callback(self, interaction: discord.Interaction):
-        with store.db() as conn:
-            msg, cmd, cwd = org.decide(conn, self.request_id, self.action == "approve", "", by="human")
-        if cmd:
-            code, text = await run_claude(cmd, cwd=cwd)
-            if code != 0:
-                msg += f" But the session didn't start: {text[-300:]}"
-        await interaction.response.edit_message(content=f"{interaction.message.content}\n**{msg}**", view=None)
+        await interaction.response.send_modal(ReplyModal(self.name))
 
 
-class AckButton(discord.ui.DynamicItem[discord.ui.Button], template=r"th:ack"):
+class AckButton(OwnerOnly, discord.ui.DynamicItem[discord.ui.Button], template=r"th:ack"):
     """Acknowledge: deletes a notice so the channel stays clean. Threads started from it survive."""
 
     def __init__(self):
@@ -159,28 +230,37 @@ class AckButton(discord.ui.DynamicItem[discord.ui.Button], template=r"th:ack"):
     async def from_custom_id(cls, interaction, item, match):
         return cls()
 
-    async def interaction_check(self, interaction) -> bool:
-        if not is_owner(interaction.user):
-            await interaction.response.send_message("Only the fleet owner can do that.", ephemeral=True)
-            return False
-        return True
-
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
         await interaction.message.delete()
 
 
-def ack_view() -> discord.ui.View:
+def buttons(*items) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
-    view.add_item(AckButton())
+    for item in items:
+        view.add_item(item)
     return view
+
+
+def ack_view() -> discord.ui.View:
+    return buttons(AckButton())
 
 
 def approval_view(approval_id: int) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    view.add_item(ApprovalButton("allow", approval_id))
-    view.add_item(ApprovalButton("deny", approval_id))
-    return view
+    return buttons(*(ApprovalButton(a, approval_id) for a in ("allow", "deny", "why")))
+
+
+async def send_to_session(interaction: discord.Interaction, name: str, text: str):
+    """Queue a message from the human for a session, the same way typing in its thread does."""
+    with store.db() as conn:
+        sess = store.session_by_name(conn, name)
+        if sess is None:
+            await interaction.response.send_message(f"No session named `{name}`.", ephemeral=True)
+            return
+        store.queue_message(conn, sess["id"], "human", interaction.user.display_name, text)
+        bot.copy_up(conn, name, text)
+    await interaction.response.send_message(embed=look.note(f"📨 Sent to **{name}**.", look.GOOD), ephemeral=True)
+    await bot.deliver_now(sess)
 
 
 # --- the bot ----------------------------------------------------------------
@@ -198,7 +278,7 @@ class Thunderhead(discord.Client):
         self.wake_failed: dict[str, float] = {}  # session id -> time of last failed wake
 
     async def setup_hook(self):
-        self.add_dynamic_items(ApprovalButton, RequestButton, AckButton)
+        self.add_dynamic_items(ApprovalButton, RequestButton, ReplyButton, AckButton)
         guild = discord.Object(GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
@@ -251,7 +331,9 @@ class Thunderhead(discord.Client):
                 return ch
         # Devs get their thread in their team's channel; everyone else in #fleet.
         parent = await self.group_channel(conn, team["name"]) if team is not None else self.channels[FLEET]
-        starter = await parent.send(f"🆕 **{sess['name']}** · `{sess['cwd']}`", view=ack_view())
+        starter = await parent.send(embed=look.card(
+            f"📂 `{sess['cwd']}`", author=f"🆕 {look.who(conn, sess['name'])}", color=look.role_color(conn, sess["name"]),
+            footer="New session · its conversation is in the thread below"), view=ack_view())
         thread = await starter.create_thread(name=sess["name"][:100], auto_archive_duration=THREAD_ARCHIVE_MINUTES)
         conn.execute("UPDATE sessions SET thread_id=? WHERE name=?", (thread.id, sess["name"]))
         return thread
@@ -274,8 +356,12 @@ class Thunderhead(discord.Client):
                 sess = store.get_session(conn, ap["session_id"])
                 thread = await self.thread_for(conn, sess)
                 msg = await self.channels[NEEDS_YOU].send(
-                    f"<@{OWNER_ID}> 🔐 **{sess['name']}** wants to use **{ap['tool_name']}** ({thread.mention})\n"
-                    f"```json\n{ap['tool_input'][:1500]}\n```",
+                    content=f"<@{OWNER_ID}>",
+                    embed=look.card(f"```json\n{ap['tool_input'][:1500]}\n```", author=look.who(conn, sess["name"]),
+                                    title=f"🔐 Wants to use {ap['tool_name']}", color=look.APPROVAL,
+                                    fields=[("Conversation", thread.mention, True),
+                                            ("Answer by", f"<t:{int(ap['created_at'] + config.APPROVAL_SECONDS)}:R>", True)],
+                                    footer="If nobody answers in time, it waits in the terminal instead"),
                     view=approval_view(ap["id"]))
                 conn.execute("UPDATE approvals SET message_id=? WHERE id=?", (msg.id, ap["id"]))
 
@@ -289,8 +375,12 @@ class Thunderhead(discord.Client):
                 except discord.HTTPException:
                     pass
                 msg = await self.channels[NEEDS_YOU].send(
-                    f"<@{OWNER_ID}> ⌛ **{sess['name']}**'s request to use **{ap['tool_name']}** expired in Discord. "
-                    f"It's now waiting in the terminal: `claude attach {short_id(sess['id'])}`", view=ack_view())
+                    content=f"<@{OWNER_ID}>",
+                    embed=look.card(f"Nobody answered in Discord in time, so the prompt is waiting in the terminal.\n"
+                                    f"Open it with `claude attach {short_id(sess['id'])}`.",
+                                    author=look.who(conn, sess["name"]),
+                                    title=f"⌛ {ap['tool_name']} request expired", color=look.NEEDS_YOU),
+                    view=buttons(ReplyButton(sess["name"]), AckButton()))
                 conn.execute("INSERT INTO needs_you_posts (message_id, session_id, created_at) VALUES (?, ?, ?)",
                              (msg.id, sess["id"], store.now()))
                 conn.execute("UPDATE approvals SET closed=1 WHERE id=?", (ap["id"],))
@@ -339,22 +429,31 @@ class Thunderhead(discord.Client):
         if kind == "team_created":
             t = store.get_team(conn, ev["channel"])
             desk = await self.team_desk(conn, t["name"])
-            await ch.send(f"👥 Team **{t['name']}** channel: its supervisor **{t['supervisor']}** and devs work "
-                          f"together here. Devs' threads live here too. Talk to the supervisor in {desk.mention}.")
-            await desk.send(f"👥 Team **{t['name']}** was created by The Thunderhead. Its supervisor "
-                            f"**{t['supervisor']}** is starting up and will introduce itself here.\n"
-                            f"Repos: {', '.join(f'`{r}`' for r in json.loads(t['repos']))}")
+            repos = "\n".join(f"`{r}`" for r in json.loads(t["repos"]))
+            await ch.send(embed=look.card(
+                f"The supervisor and its devs work together here, and devs' threads live here too.\n"
+                f"Talk to the supervisor in {desk.mention}.", title=f"👥 Team {t['name']}",
+                color=look.SUPERVISOR, fields=[("Supervisor", t["supervisor"], True), ("Repositories", repos, True)]))
+            await desk.send(embed=look.card(
+                f"The Thunderhead created this team. Its supervisor **{t['supervisor']}** is starting up and will "
+                "introduce itself here. Talk to it in this channel.", title=f"👥 Team {t['name']}",
+                color=look.SUPERVISOR, fields=[("Repositories", repos, False)]))
         elif kind == "channel_created":
             row = store.get_channel(conn, ev["channel"])
-            await ch.send(f"📣 **#{ev['channel']}** was created by The Thunderhead."
-                          + (f"\nTopic: {row['topic']}" if row["topic"] else "") + f"\n{body}\n"
-                          "Everything posted here, by a member or by you, goes to every member.")
+            members = body.split("Members: ", 1)[-1]
+            await ch.send(embed=look.card(
+                "A post here reaches the members it names. Yours, with no @mentions, reach everyone.",
+                title=f"📣 #{ev['channel']}", color=look.AGENTS,
+                fields=[("Topic", row["topic"] or "—", False), ("Members", members, False)]))
         elif kind == "channel_post":
-            await send_long(ch, body, prefix=f"**{who}**: ")
+            pinged, _, text = body.partition("\n")
+            await look.send_card(ch, text or body, author=look.who(conn, who), color=look.role_color(conn, who),
+                                 footer=pinged if pinged.startswith("→") else None)
         elif kind == "channel_note":
-            await ch.send(body)
+            await ch.send(embed=look.note(body, look.AGENTS))
         elif kind == "channel_closed":
-            await ch.send("🔒 This channel was closed by The Thunderhead. Sessions no longer receive posts here.")
+            await ch.send(embed=look.note("🔒 **Closed.** Sessions no longer get posts here; it stays as the record.",
+                                          look.QUIET))
             await ch.set_permissions(self.guild.default_role, send_messages=False)
 
     async def on_raw_thread_update(self, payload: discord.RawThreadUpdateEvent):
@@ -374,16 +473,16 @@ class Thunderhead(discord.Client):
             post = conn.execute("SELECT message_id FROM archived_posts WHERE thread_id=?", (thread_id,)).fetchone()
             archived_ch = self.channels[ARCHIVED]
             if archived and post is None:
-                msg = await archived_ch.send(self.archived_line(conn, sess, int(time.time())))
+                msg = await archived_ch.send(embed=self.archived_card(conn, sess, look.now()))
                 conn.execute("INSERT INTO archived_posts (thread_id, message_id) VALUES (?, ?)", (thread_id, msg.id))
             elif archived and post is not None:
                 # Already listed: refresh it, since the session's state may have changed since.
                 try:
                     old = await archived_ch.fetch_message(post["message_id"])
-                    stamp = re.search(r"<t:(\d+):R>", old.content)
-                    text = self.archived_line(conn, sess, int(stamp.group(1)) if stamp else int(time.time()))
-                    if old.content != text:
-                        await old.edit(content=text)
+                    stamp = old.embeds[0].timestamp if old.embeds and old.embeds[0].timestamp else look.now()
+                    new = self.archived_card(conn, sess, stamp)
+                    if old.content or not old.embeds or old.embeds[0].description != new.description:
+                        await old.edit(content=None, embed=new)
                 except discord.NotFound:
                     conn.execute("DELETE FROM archived_posts WHERE thread_id=?", (thread_id,))
             elif not archived and post is not None:
@@ -429,7 +528,7 @@ class Thunderhead(discord.Client):
                 thread = None
         if isinstance(thread, discord.Thread):
             if keep_thread:
-                await thread.send(f"🗑️ **{name}** was deleted{note}. This thread is kept as its record.")
+                await thread.send(embed=look.note(f"🗑️ **{name}** was deleted{note}. This thread is kept as its record."))
                 await self.archive(thread)
             else:
                 if listing:
@@ -448,18 +547,18 @@ class Thunderhead(discord.Client):
         what = "Its thread is kept and archived." if keep_thread else "Its thread is gone too."
         return f"🗑️ Deleted **{name}**. {what} The name is free again."
 
-    def archived_line(self, conn, sess, archived_at: int) -> str:
+    def archived_card(self, conn, sess, archived_at) -> discord.Embed:
         """An #archived listing: what the session is now, in words, with a link to its thread."""
-        state = {store.SLEEPING: "💤 asleep: any message wakes it",
-                 "stopped": "⏹️ stopped: only you can wake it",
-                 "ended": "⚫ ended: a message from you brings it back",
-                 "gone": "⚫ ended: a message from you brings it back",
-                 "deleted": "🗑️ deleted: this thread is kept as its record"}.get(sess["status"], sess["status"])
-        role, team = store.rank(conn, sess["name"])
-        tag = f" [{team}]" if team else ""
-        summary = f"\nLast status: {sess['summary']}" if sess["summary"] else ""
-        return (f"🗄️ **{sess['name']}**{tag} · <#{sess['thread_id']}>\n{state}. Archived <t:{archived_at}:R>."
-                f"{summary}")
+        state = {store.SLEEPING: "💤 **Asleep**: any message wakes it.",
+                 "stopped": "⏹️ **Stopped**: only you can wake it.",
+                 "ended": "⚫ **Ended**: a message from you brings it back.",
+                 "gone": "⚫ **Ended**: a message from you brings it back.",
+                 "deleted": "🗑️ **Deleted**: this thread is kept as its record."}.get(sess["status"], sess["status"])
+        e = look.card(f"{state}\n{'Last status: ' + sess['summary'] if sess['summary'] else ''}\n<#{sess['thread_id']}>",
+                      author=f"🗄️ {look.who(conn, sess['name']).split(' ', 1)[1]}", color=look.QUIET, stamp=False,
+                      footer="Archived")
+        e.timestamp = archived_at
+        return e
 
     async def archive(self, thread):
         """Archive a finished session's thread. Nothing is lost; it unarchives if the session returns."""
@@ -479,50 +578,64 @@ class Thunderhead(discord.Client):
         thread = await self.thread_for(conn, sess)
         kind, body = ev["kind"], ev["body"]
         if kind == "request_escalated":
-            req = org.get_request(conn, int(body))
-            view = discord.ui.View(timeout=None)
-            view.add_item(RequestButton("approve", req["id"]))
-            view.add_item(RequestButton("reject", req["id"]))
-            if req["action"] == "charter":
-                # Charters are between the human and the supervisor, so they go to the team's desk.
-                desk = await self.team_desk(conn, req["team"])
-                text = json.loads(req["params"])["text"]
-                await send_long(desk, text, prefix=f"📜 **Proposed charter for team {req['team']}**\n\n")
-                msg = await desk.send(f"<@{OWNER_ID}> Approve this charter? {req['from_name']}'s summary: "
-                                      f"{req['reason'][:1200]}", view=view)
-            else:
-                asker = "The Thunderhead wants" if req["from_name"] == store.LEAD else f"{req['from_name']} wants"
-                msg = await self.channels[LEAD_CHANNEL].send(
-                    f"<@{OWNER_ID}> 📋 {asker} your call on a request:\n```\n{org.describe(req)[:1400]}\n```"
-                    + (f"Thunderhead's note: {req['note']}" if req["note"] else ""), view=view)
-            conn.execute("UPDATE requests SET message_id=? WHERE id=?", (msg.id, req["id"]))
+            await self.post_request(conn, org.get_request(conn, int(body)))
             return
+        name = sess["name"]
         if kind == "report":
-            await send_long(thread, body)
+            await look.send_card(thread, body, author=look.who(conn, name), color=look.role_color(conn, name))
         elif kind == "status":
-            await thread.send(f"📌 {body}")
+            state, _, rest = body.partition(":")
+            await thread.send(embed=look.note(f"📌 {state}:{rest}", look.role_color(conn, name)))
         elif kind == "session_start":
-            await thread.send(f"🟢 Session started in {body}")
+            await thread.send(embed=look.note(f"🟢 **Started** in {body}"))
         elif kind == "session_end":
-            await thread.send(f"⚫ Session ended: {body}")
+            await thread.send(embed=look.note(f"⚫ **Ended** ({body}). A message here brings it back."))
             await self.archive(thread)
         elif kind == "woken":
-            await thread.send(f"⏰ {body}")
+            await thread.send(embed=look.note(f"⏰ {body}"))
         elif kind == "stopped":
-            await thread.send(f"⏹️ Stopped from Discord. {body}")
+            await thread.send(embed=look.note(f"⏹️ **Stopped.** {body}"))
             await self.archive(thread)
         elif kind == "needs_you":
-            await thread.send(f"🔔 {body}")
+            await thread.send(embed=look.note(f"🔔 {body}", look.NEEDS_YOU))
             msg = await self.channels[NEEDS_YOU].send(
-                f"<@{OWNER_ID}> 🔔 **{sess['name']}**: {body[:1500]} ({thread.mention})", view=ack_view())
+                content=f"<@{OWNER_ID}>",
+                embed=look.card(body[:1500], author=look.who(conn, name), title="🔔 Needs you", color=look.NEEDS_YOU,
+                                fields=[("Conversation", thread.mention, True)]),
+                view=buttons(ReplyButton(name), AckButton()))
             conn.execute("INSERT INTO needs_you_posts (message_id, session_id, created_at) VALUES (?, ?, ?)",
                          (msg.id, sess["id"], store.now()))
-        elif kind == "agent_msg":
-            await send_long(thread, body)
-            await send_long(self.channels[CHATTER], body, prefix=f"**{sess['name']}** ")
-        elif kind == "agent_msg_in":
-            # Already in #agent-chatter from the sender's side; only the recipient's thread needs it.
-            await send_long(thread, body)
+        elif kind in ("agent_msg", "agent_msg_in"):
+            # Bodies look like "📤 to **x** (hop 2): text" or "📥 from **x** (hop 2): text".
+            m = re.match(r"(📤 to|📥 from) \*\*(.+?)\*\* \(hop (\d+)\): (.*)", body, re.S)
+            arrow, other, hop, text = m.groups() if m else ("", "", "?", body)
+            header = f"{name} → {other}" if arrow.startswith("📤") else f"{other} → {name}"
+            await look.send_card(thread, text, author=f"💬 {header}", color=look.AGENTS, footer=f"hop {hop}")
+            if kind == "agent_msg":
+                await look.send_card(self.channels[CHATTER], text, author=f"💬 {header}", color=look.AGENTS,
+                                     footer=f"hop {hop}")
+
+    async def post_request(self, conn, req):
+        """A request the human must decide: charters go to the team's desk, everything else to #thunderhead."""
+        charter = req["action"] == "charter"
+        view = buttons(RequestButton("approve", req["id"]), RequestButton("reject", req["id"], charter=charter))
+        if charter:
+            desk = await self.team_desk(conn, req["team"])
+            text = json.loads(req["params"])["text"]
+            await look.send_card(desk, text, title=f"📜 Proposed charter · team {req['team']}", color=look.SUPERVISOR)
+            msg = await desk.send(content=f"<@{OWNER_ID}>", embed=look.card(
+                req["reason"][:1500], title="Approve this charter?", author=look.who(conn, req["from_name"]),
+                color=look.APPROVAL, footer="Request changes to send the supervisor your feedback"), view=view)
+        else:
+            params = json.loads(req["params"])
+            details = "\n".join(f"**{k}:** {str(v)[:300]}" for k, v in params.items())
+            fields = [("Team", req["team"], True), ("Asked by", req["from_name"], True), ("Why", req["reason"], False)]
+            if req["note"]:
+                fields.append(("The Thunderhead's note", req["note"], False))
+            msg = await self.channels[LEAD_CHANNEL].send(content=f"<@{OWNER_ID}>", embed=look.card(
+                details, title=f"📋 Request #{req['id']} · {req['action']}", color=look.APPROVAL, fields=fields,
+                footer="Reject to send feedback along with it"), view=view)
+        conn.execute("UPDATE requests SET message_id=? WHERE id=?", (msg.id, req["id"]))
 
     async def clear_needs_you(self):
         """Remove #needs-you notices for sessions that don't need the human any more."""
@@ -553,12 +666,18 @@ class Thunderhead(discord.Client):
                 "AND (thread_id IS NULL OR thread_id NOT IN (SELECT thread_id FROM archived_posts)) "
                 f"ORDER BY status IN {store.DEAD}, created_at",
                 (time.time() - 3600, time.time() - 86400)).fetchall()
-            lines, seen = [], set()
+            seen, groups = set(), {}
             for s in rows:
                 if s["name"] in seen or not store.is_current(conn, s):
                     continue  # older rows of a resumed session
                 seen.add(s["name"])
-                lines.append(self.session_line(conn, s))
+                role, team = store.rank(conn, s["name"])
+                key = "👑 The Thunderhead" if role == "lead" else f"🧭 Team {team}" if team else "🛠️ Without a team"
+                groups.setdefault(key, []).append((role != "supervisor", self.session_line(conn, s)))
+            order = sorted(groups, key=lambda k: (not k.startswith("👑"), k.startswith("🛠️"), k))
+            lines = []
+            for key in order:
+                lines += ([""] if lines else []) + [f"**{key}**"] + [line for _, line in sorted(groups[key])]
             pages = board_pages(lines)
             if pages == self.last_board:
                 return
@@ -576,8 +695,8 @@ class Thunderhead(discord.Client):
                     break
             if msgs is not None and len(msgs) == len(pages):
                 for msg, page in zip(msgs, pages):
-                    if msg.content != page:
-                        await msg.edit(content=page)
+                    if msg.content or not msg.embeds or msg.embeds[0].description != page:
+                        await msg.edit(content=None, embed=board_embed(page, len(seen)))
                 store.kv_set(conn, "board_message_ids", json.dumps([m.id for m in msgs]))
             else:
                 # The page count changed: post the board afresh so its pages stay together.
@@ -586,7 +705,7 @@ class Thunderhead(discord.Client):
                         await msg.delete()
                     except discord.HTTPException:
                         pass
-                msgs = [await fleet.send(page) for page in pages]
+                msgs = [await fleet.send(embed=board_embed(page, len(seen))) for page in pages]
                 try:
                     await msgs[0].pin()
                 except discord.HTTPException:
@@ -596,11 +715,11 @@ class Thunderhead(discord.Client):
             self.last_board = pages
 
     def session_line(self, conn, s) -> str:
-        role, team = store.rank(conn, s["name"])
-        tag = {"lead": " 👑", "supervisor": f" [{team} · supervisor]", "dev": f" [{team}]"}.get(role, "")
+        role, _ = store.rank(conn, s["name"])
+        tag = " · supervisor" if role == "supervisor" else ""
         where = f" · <#{s['thread_id']}>" if s["thread_id"] else ""
-        summary = f" — {s['summary']}" if s["summary"] else ""
-        return f"{ICONS.get(s['status'], '❔')} **{s['name']}**{tag} `{s['status']}`{summary}{where}"
+        summary = f"\n╰ {s['summary']}" if s["summary"] else ""
+        return f"{ICONS.get(s['status'], '❔')} **{s['name']}**{tag} `{s['status']}`{where}{summary}"
 
     @tasks.loop(seconds=5)
     async def liveness(self):
@@ -826,8 +945,9 @@ class Thunderhead(discord.Client):
         """Start a fresh Thunderhead: no earlier conversation, memory from hq/NOTES.md."""
         cmd, cwd = lead_command(first_message)
         code, text = await run_claude(cmd, cwd=cwd)
-        await self.channels[LEAD_CHANNEL].send(
-            "⚡ Starting a fresh Thunderhead…" if code == 0 else f"Couldn't start The Thunderhead:\n```\n{text}\n```")
+        await self.channels[LEAD_CHANNEL].send(embed=look.note(
+            "⚡ Starting a fresh Thunderhead…", look.LEAD) if code == 0 else look.card(
+            f"```\n{text}\n```", title="Couldn't start The Thunderhead", color=look.BAD))
         return code, text
 
     async def deliver_now(self, sess, message=None):
@@ -835,8 +955,8 @@ class Thunderhead(discord.Client):
         if sess["status"] in store.DEAD or sess["status"] == store.SLEEPING:
             asyncio.create_task(self.wake(sess))
         elif not sess["listen"] and sess["status"] not in ("working", "needs_you") and message:
-            await message.reply("Queued. This session runs in a terminal and isn't listening, so it gets "
-                                "the message when its next turn ends.", mention_author=False)
+            await message.reply(embed=look.note("📨 Queued. This session runs in a terminal and isn't listening, "
+                                                "so it gets the message when its next turn ends."), mention_author=False)
 
 
 bot = Thunderhead()
@@ -907,50 +1027,81 @@ async def status(interaction: discord.Interaction):
     if not await owner_only(interaction):
         return
     with store.db() as conn:
-        rows = store.live_sessions(conn)
-    lines = [f"{ICONS.get(s['status'], '❔')} **{s['name']}** `{s['status']}` {s['summary'] or ''}" for s in rows]
-    await interaction.response.send_message("\n".join(lines)[:1990] or "No live sessions.", ephemeral=True)
+        lines = [bot.session_line(conn, s) for s in store.live_sessions(conn) if store.is_current(conn, s)]
+    await interaction.response.send_message(embeds=[board_embed(p, len(lines)) for p in board_pages(lines)][:10],
+                                            ephemeral=True)
 
 
-@bot.tree.command(description="Send a message to a session")
+@bot.tree.command(description="Send a message to a session (leave out the message for a form)")
+@app_commands.describe(message="Leave it out to write a longer message in a pop-up form")
 @app_commands.autocomplete(session=session_names)
-async def send(interaction: discord.Interaction, session: str, message: str):
+async def send(interaction: discord.Interaction, session: str, message: str | None = None):
     if not await owner_only(interaction):
         return
-    with store.db() as conn:
-        sess = store.session_by_name(conn, session)
-        if sess is None:
-            await interaction.response.send_message(f"No session named `{session}`.", ephemeral=True)
-            return
-        store.queue_message(conn, sess["id"], "human", interaction.user.display_name, message)
-    await interaction.response.send_message(f"📨 Queued for **{session}**.", ephemeral=True)
-    await bot.deliver_now(sess)
+    if message is None:
+        await interaction.response.send_modal(ReplyModal(session))
+        return
+    await send_to_session(interaction, session, message)
 
 
-@bot.tree.command(description="Start a new background Claude session")
-@app_commands.describe(directory="Working directory (absolute or ~/...)", task="What the session should do",
+class SpawnModal(OwnerOnly, discord.ui.Modal, title="Start a session"):
+    """The /spawn form: room for a real multi-line task."""
+
+    def __init__(self, directory: str, name: str | None, options: dict):
+        super().__init__(title=f"Start a session{' on team ' + options['team'] if options.get('team') else ''}"[:45])
+        self.directory = _text("Working directory", default=directory or None, max_length=500,
+                               placeholder="~/projects/my-app (leave empty for a fresh workspace)", required=False)
+        self.session_name = _text("Name (optional)", default=name, required=False, max_length=40,
+                                  placeholder="letters, digits, - and _")
+        self.task = _text("Task", paragraph=True, placeholder="What should the session do? Give it everything it needs.")
+        for item in (self.directory, self.session_name, self.task):
+            self.add_item(item)
+        self.options = options
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await do_spawn(interaction, self.directory.component.value.strip(), self.task.component.value,
+                       self.session_name.component.value.strip() or None, **self.options)
+
+
+@bot.tree.command(description="Start a new background Claude session (leave out the task for a form)")
+@app_commands.describe(directory="Working directory (absolute or ~/...); empty for a fresh workspace",
+                       task="What the session should do. Leave it out to write it in a pop-up form",
                        name="Session name (letters, digits, - and _)", mode="Permission mode",
                        team="Put it on this team as a dev, reporting to the team's supervisor",
                        oneoff="Delete it automatically once it's done and falls asleep (its thread is kept)")
 @app_commands.choices(mode=[app_commands.Choice(name=m, value=m)
                             for m in ("default", "acceptEdits", "auto", "plan")])
 @app_commands.autocomplete(team=team_names)
-async def spawn(interaction: discord.Interaction, directory: str, task: str,
+async def spawn(interaction: discord.Interaction, directory: str = "", task: str | None = None,
                 name: str | None = None, mode: app_commands.Choice[str] | None = None,
                 team: str | None = None, oneoff: bool = False):
     if not await owner_only(interaction):
         return
-    cwd = Path(directory).expanduser()
-    if not cwd.is_dir() or launch.forbidden_dir(cwd):
-        await interaction.response.send_message(launch.forbidden_dir(cwd) or f"`{cwd}` is not a directory.",
-                                                ephemeral=True)
+    options = {"mode": mode.value if mode else None, "team": team, "oneoff": oneoff}
+    if task is None:
+        await interaction.response.send_modal(SpawnModal(directory, name, options))
         return
-    name = name or f"{cwd.name or 'root'}-{secrets.token_hex(2)}"
+    await do_spawn(interaction, directory, task, name, **options)
+
+
+async def do_spawn(interaction: discord.Interaction, directory: str, task: str, name: str | None,
+                   mode: str | None = None, team: str | None = None, oneoff: bool = False):
+    async def fail(text):
+        await interaction.response.send_message(embed=look.card(text, title="Couldn't start it", color=look.BAD),
+                                                ephemeral=True)
+    if directory:
+        cwd = Path(directory).expanduser()
+        if not cwd.is_dir() or launch.forbidden_dir(cwd):
+            await fail(launch.forbidden_dir(cwd) or f"`{cwd}` is not a directory.")
+            return
+    else:
+        cwd = None
+    name = name or f"{cwd.name if cwd else 'session'}-{secrets.token_hex(2)}"
     if not NAME_RE.match(name) or name == store.LEAD:
-        await interaction.response.send_message("Names can only use letters, digits, - and _ "
-                                                "('thunderhead' is taken by The Thunderhead).", ephemeral=True)
+        await fail("Names can only use letters, digits, - and _ ('thunderhead' is taken by The Thunderhead).")
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
+    cwd = cwd or launch.workspace_dir(name)
 
     if team:
         with store.db() as conn:
@@ -962,27 +1113,31 @@ async def spawn(interaction: discord.Interaction, directory: str, task: str,
                 org.fyi(conn, store.get_team(conn, team)["supervisor"],
                         f"The human spawned '{name}' onto your team with this task: {task[:1000]}")
         if err:
-            await interaction.followup.send(err, ephemeral=True)
+            await interaction.followup.send(embed=look.card(err, title="Couldn't start it", color=look.BAD),
+                                            ephemeral=True)
             return
         prompt = cmd.pop()
     else:
         cmd, prompt = bg_command(name), task
-    if mode and mode.value != "default":
-        cmd += ["--permission-mode", mode.value]
+    if mode and mode != "default":
+        cmd += ["--permission-mode", mode]
     code, text = await run_claude(cmd + [prompt], cwd=cwd)
     if code != 0:
         if team:
             with store.db() as conn:
                 org.undo_spawn(conn, team, name)
-        await interaction.followup.send(f"Spawn failed:\n```\n{text}\n```", ephemeral=True)
+        await interaction.followup.send(embed=look.card(f"```\n{text}\n```", title="Spawn failed", color=look.BAD),
+                                        ephemeral=True)
         return
     if oneoff:
         with store.db() as conn:
             conn.execute("INSERT OR IGNORE INTO oneoffs (name) VALUES (?)", (name,))
     where = f"team {team}'s channel" if team else f"#{FLEET}"
-    extra = " It's a one-off: it'll be deleted once it's done and falls asleep." if oneoff else ""
-    await interaction.followup.send(f"🚀 Spawned **{name}** in `{cwd}`. Its thread appears in {where} "
-                                    f"once it starts.{extra}\n```\n{text}\n```", ephemeral=True)
+    fields = [("Folder", f"`{cwd}`", False), ("Thread", f"appears in {where} once it starts", True)]
+    if oneoff:
+        fields.append(("One-off", "deleted once it's done and falls asleep; its thread is kept", True))
+    await interaction.followup.send(embed=look.card(task[:1500], title=f"🚀 Started {name}", color=look.GOOD,
+                                                    fields=fields), ephemeral=True)
 
 
 @bot.tree.command(name="archive", description="Done with a conversation: file its thread away and let the session sleep")
@@ -1024,9 +1179,10 @@ async def archive_cmd(interaction: discord.Interaction, session: str | None = No
             await run_claude(["claude", "stop", short_id(sess["id"])])
     with store.db() as conn:
         thread = await bot.thread_for(conn, sess)
-    await thread.send("🗄️ Archived by you. A message here, or from another session, wakes it again.")
+    await thread.send(embed=look.note("🗄️ **Archived by you.** A message here, or from another session, wakes it again."))
     await bot.archive(thread)
-    await interaction.followup.send(f"🗄️ Archived **{sess['name']}**. It's listed in #{ARCHIVED}.", ephemeral=True)
+    await interaction.followup.send(embed=look.note(f"🗄️ Archived **{sess['name']}**. It's listed in #{ARCHIVED}."),
+                                    ephemeral=True)
 
 
 class ConfirmDelete(discord.ui.View):
@@ -1039,13 +1195,13 @@ class ConfirmDelete(discord.ui.View):
 
     @discord.ui.button(label="Delete forever", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content=f"Deleting **{self.name}**…", view=None)
+        await interaction.response.edit_message(embed=look.note(f"Deleting **{self.name}**…"), view=None)
         result = await bot.delete_session(self.name, self.keep_thread)
-        await interaction.edit_original_response(content=result)
+        await interaction.edit_original_response(embed=look.note(result, look.GOOD if result.startswith("🗑️") else look.BAD))
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Cancelled. Nothing was deleted.", view=None)
+        await interaction.response.edit_message(embed=look.note("Cancelled. Nothing was deleted."), view=None)
 
 
 @bot.tree.command(name="delete", description="Delete a session for good (asks you to confirm)")
@@ -1063,9 +1219,9 @@ async def delete(interaction: discord.Interaction, session: str, keep_thread: bo
         return
     busy = " It's **working right now**; deleting stops it mid-task." if sess["status"] in ("working", "needs_you") else ""
     thread = "Its thread is kept and archived." if keep_thread else "Its thread and history in Discord go too."
-    await interaction.response.send_message(
-        f"Delete **{session}** for good?{busy}\nThis stops it, removes its Claude job and its fleet records, "
-        f"and frees the name. {thread} It can't be undone.",
+    await interaction.response.send_message(embed=look.card(
+        f"This stops it, removes its Claude job and its fleet records, and frees the name. {thread}{busy}",
+        title=f"🗑️ Delete {session} for good?", color=look.BAD, footer="This can't be undone"),
         view=ConfirmDelete(session, keep_thread), ephemeral=True)
 
 
@@ -1092,10 +1248,12 @@ async def stop(interaction: discord.Interaction, session: str):
         else:
             store.post(conn, sess["id"], "stopped", "Other agents can't wake it now. Send a message here to start it again.")
     if code != 0:
-        await interaction.followup.send(f"Couldn't stop **{session}** (only background sessions can be "
-                                        f"stopped from here):\n```\n{text}\n```", ephemeral=True)
+        await interaction.followup.send(embed=look.card(
+            f"Only background sessions can be stopped from here.\n```\n{text}\n```",
+            title=f"Couldn't stop {session}", color=look.BAD), ephemeral=True)
         return
-    await interaction.followup.send(f"⏹️ Stopped **{session}**. Its conversation is kept.\n{resume_hint(sess)}",
+    await interaction.followup.send(embed=look.card(resume_hint(sess), title=f"⏹️ Stopped {session}",
+                                                    color=look.QUIET, footer="Its conversation is kept"),
                                     ephemeral=True)
 
 
@@ -1120,9 +1278,9 @@ async def cleanup(interaction: discord.Interaction, days: app_commands.Range[int
         return
     names = ", ".join(s["name"] for s in rows)
     if not confirm:
-        await interaction.followup.send(f"Would delete {len(rows)} thread(s): {names}.\n"
-                                        f"This can't be undone. Run `/cleanup days:{days} confirm:True` to do it.",
-                                        ephemeral=True)
+        await interaction.followup.send(embed=look.card(
+            names, title=f"🧹 Would delete {len(rows)} thread(s)", color=look.APPROVAL,
+            footer=f"This can't be undone. Run /cleanup days:{days} confirm:True to do it."), ephemeral=True)
         return
     deleted = 0
     for s in rows:
@@ -1142,7 +1300,8 @@ async def cleanup(interaction: discord.Interaction, days: app_commands.Range[int
                 conn.execute("DELETE FROM archived_posts WHERE thread_id=?", (s["thread_id"],))
             conn.execute("UPDATE sessions SET thread_id=NULL WHERE id=?", (s["id"],))
             conn.execute("DELETE FROM sessions WHERE id=? AND status='deleted'", (s["id"],))
-    await interaction.followup.send(f"🧹 Deleted {deleted} thread(s): {names}.", ephemeral=True)
+    await interaction.followup.send(embed=look.card(names, title=f"🧹 Deleted {deleted} thread(s)", color=look.GOOD),
+                                    ephemeral=True)
 
 
 @bot.tree.command(name="team-config", description="Set a team's autonomy and dev limit directly")
@@ -1161,13 +1320,14 @@ async def team_config(interaction: discord.Interaction, team: str,
             await interaction.response.send_message(f"No team `{team}`.", ephemeral=True)
             return
         if autonomy is None and max_devs is None:
-            await interaction.response.send_message(
-                f"**{team}**: autonomy={t['autonomy']}, max_devs={t['max_devs']} "
-                f"({store.dev_count(conn, team)} now), charter {t['charter_status']}", ephemeral=True)
+            await interaction.response.send_message(embed=look.card(
+                title=f"🧭 Team {team}", color=look.SUPERVISOR, fields=[
+                    ("Autonomy", t["autonomy"], True), ("Devs", f"{store.dev_count(conn, team)} of {t['max_devs']}", True),
+                    ("Charter", t["charter_status"], True)]), ephemeral=True)
             return
         result = org.apply_config(conn, team, {"autonomy": autonomy.value if autonomy else None,
                                               "max_devs": max_devs}, by="human")
-    await interaction.response.send_message(result, ephemeral=True)
+    await interaction.response.send_message(embed=look.note(f"⚙️ {result}", look.SUPERVISOR), ephemeral=True)
 
 
 @bot.tree.command(description="Give The Thunderhead a fresh start (its memory comes from hq/NOTES.md)")
@@ -1184,7 +1344,8 @@ async def wipe(interaction: discord.Interaction):
         await run_claude(["claude", "stop", short_id(lead["id"])])
         with store.db() as conn:
             store.set_status(conn, lead["id"], "wiped")
-    await bot.channels[LEAD_CHANNEL].send("🧹 **Wiped.** The Thunderhead's conversation was cleared.")
+    await bot.channels[LEAD_CHANNEL].send(embed=look.note("🧹 **Wiped.** The Thunderhead's conversation was cleared. "
+                                                           "It starts again from its notes.", look.LEAD))
     code, text = await bot.start_lead()
     await interaction.followup.send("Fresh Thunderhead starting." if code == 0 else f"Failed:\n```\n{text}\n```",
                                     ephemeral=True)

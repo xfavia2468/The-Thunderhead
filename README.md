@@ -27,7 +27,9 @@ Only sessions started with `bin/th-claude` or `/spawn` are connected. Your globa
 
 The bot uses channels named `#fleet`, `#needs-you`, `#agent-chatter`, `#thunderhead` and `#archived`, and creates any that are missing. Group channels go in a **groups** category.
 
-- `#fleet` is the board: one line per session, nothing hidden. If it outgrows one message, it continues in more. New-session notices have an Acknowledge button that clears them; their threads stay, linked from the board.
+Messages are embeds whose side-bar color says who's talking or what it is: gold for The Thunderhead, purple for supervisors and teams, blue for devs, amber for "needs you", orange for decisions, green or red for their outcome, teal for sessions talking to each other, grey for lifecycle notices. Leaving out the text of `/spawn` or `/send` opens a form with room for multi-line text. Rejecting a request or a charter opens a form for feedback.
+
+- `#fleet` is the board: one line per session, grouped by The Thunderhead, each team, and sessions without a team. Nothing is hidden. If it outgrows one message, it continues in more. New-session notices have an Acknowledge button that clears them; their threads stay, linked from the board.
 - `#needs-you` only holds what still needs you. Answered approvals remove themselves, and their outcome goes to the session's thread.
 - `#archived` lists every archived session thread with a link. A thread is archived when its session stops or ends, or after a day without activity, and its listing disappears as soon as the session comes back. `/cleanup` deletes long-finished sessions' threads, but only with `confirm:True`.
 
@@ -49,14 +51,15 @@ Re-run `setup_config.py` if you move the folder or change the timeouts.
 
 | | |
 |---|---|
-| `/spawn directory task [name] [mode] [team] [oneoff]` | Start a background session. It listens for messages and sends permission prompts to Discord. With `team`, it joins that team as a dev. With `oneoff:True`, it's deleted automatically once it's done and falls asleep; its thread is kept, archived, since it holds the result. |
+| `/spawn [directory] [task] [name] [mode] [team] [oneoff]` | Start a background session. It listens for messages and sends permission prompts to Discord. With `team`, it joins that team as a dev. With `oneoff:True`, it's deleted automatically once it's done and falls asleep; its thread is kept, archived, since it holds the result. |
 | Type in a session's thread | Message that session. 📨 means it's queued. |
-| `/send session message` | Same as above, from anywhere. |
+| **Reply** on a #needs-you notice | Answer that session in a pop-up form, without leaving the channel. |
+| `/send session [message]` | Same as above, from anywhere. Leave out the message to write a longer one in a form. |
 | `/status` | Quick list of sessions. The pinned message in `#fleet` stays up to date too. |
 | `/delete session [keep_thread]` | Delete a session for good, after you confirm: its process, Claude job, fleet records and (unless `keep_thread`) its thread. The name is free again. Not for The Thunderhead (use `/wipe`) or supervisors. |
 | `/archive [session]` | Done with a conversation: archive its thread now and put the session to sleep, instead of waiting. Anyone can still wake it with a message. Inside a thread, leave out the name. |
 | `/stop session` | Pause a session on purpose. It shows as ⏹️ stopped, and other agents can't wake it. A message from you still does. |
-| Approve / Deny buttons in `#needs-you` | Answer a permission prompt. |
+| Approve / Deny / Deny with reason in `#needs-you` | Answer a permission prompt. A reason is passed to the session, so it knows what to do instead. |
 | Type in `#thunderhead` | Talk to The Thunderhead, the lead session (below). Your first message there starts it. |
 | `/wipe` | Clear The Thunderhead's conversation and start it fresh. |
 | Type in a channel under **groups** | Post to every session in that group channel. |

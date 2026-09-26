@@ -163,6 +163,7 @@ MIGRATIONS = [
     "ALTER TABLE teams ADD COLUMN max_devs INTEGER DEFAULT 3",
     "ALTER TABLE teams ADD COLUMN charter_status TEXT DEFAULT 'draft'",
     "ALTER TABLE oneoffs ADD COLUMN by_lead INTEGER DEFAULT 0",  # spawned by The Thunderhead
+    "ALTER TABLE approvals ADD COLUMN reason TEXT",  # the human's reason when denying
 ]
 
 # The lead session: its name, and the role that unlocks its tools.
@@ -319,11 +320,11 @@ def create_approval(conn, sid, tool_name, tool_input) -> int:
     return cur.lastrowid
 
 
-def decide_approval(conn, approval_id, decision) -> bool:
+def decide_approval(conn, approval_id, decision, reason: str = "") -> bool:
     """Record a decision; False if it was already decided or expired."""
     cur = conn.execute(
-        "UPDATE approvals SET status=?, decided_at=? WHERE id=? AND status='pending'",
-        (decision, now(), approval_id))
+        "UPDATE approvals SET status=?, reason=?, decided_at=? WHERE id=? AND status='pending'",
+        (decision, reason or None, now(), approval_id))
     return cur.rowcount == 1
 
 
