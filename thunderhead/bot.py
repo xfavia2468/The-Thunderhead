@@ -374,10 +374,18 @@ class Thunderhead(discord.Client):
             post = conn.execute("SELECT message_id FROM archived_posts WHERE thread_id=?", (thread_id,)).fetchone()
             archived_ch = self.channels[ARCHIVED]
             if archived and post is None:
-                msg = await archived_ch.send(
-                    f"🗄️ {self.session_line(conn, sess)}\nArchived <t:{int(time.time())}:R>. "
-                    "It comes back if the session wakes or anyone posts in it.")
+                msg = await archived_ch.send(self.archived_line(conn, sess, int(time.time())))
                 conn.execute("INSERT INTO archived_posts (thread_id, message_id) VALUES (?, ?)", (thread_id, msg.id))
+            elif archived and post is not None:
+                # Already listed: refresh it, since the session's state may have changed since.
+                try:
+                    old = await archived_ch.fetch_message(post["message_id"])
+                    stamp = re.search(r"<t:(\d+):R>", old.content)
+                    text = self.archived_line(conn, sess, int(stamp.group(1)) if stamp else int(time.time()))
+                    if old.content != text:
+                        await old.edit(content=text)
+                except discord.NotFound:
+                    conn.execute("DELETE FROM archived_posts WHERE thread_id=?", (thread_id,))
             elif not archived and post is not None:
                 try:
                     old = await archived_ch.fetch_message(post["message_id"])
@@ -439,6 +447,19 @@ class Thunderhead(discord.Client):
                 await thread.delete()
         what = "Its thread is kept and archived." if keep_thread else "Its thread is gone too."
         return f"🗑️ Deleted **{name}**. {what} The name is free again."
+
+    def archived_line(self, conn, sess, archived_at: int) -> str:
+        """An #archived listing: what the session is now, in words, with a link to its thread."""
+        state = {store.SLEEPING: "💤 asleep: any message wakes it",
+                 "stopped": "⏹️ stopped: only you can wake it",
+                 "ended": "⚫ ended: a message from you brings it back",
+                 "gone": "⚫ ended: a message from you brings it back",
+                 "deleted": "🗑️ deleted: this thread is kept as its record"}.get(sess["status"], sess["status"])
+        role, team = store.rank(conn, sess["name"])
+        tag = f" [{team}]" if team else ""
+        summary = f"\nLast status: {sess['summary']}" if sess["summary"] else ""
+        return (f"🗄️ **{sess['name']}**{tag} · <#{sess['thread_id']}>\n{state}. Archived <t:{archived_at}:R>."
+                f"{summary}")
 
     async def archive(self, thread):
         """Archive a finished session's thread. Nothing is lost; it unarchives if the session returns."""
