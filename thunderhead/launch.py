@@ -18,11 +18,18 @@ NOTES_TEMPLATE = """# ThunderHead notes
 
 Your memory across wipes. Keep it short and current: rewrite stale parts instead of only appending.
 
+## Session roster
+
+<!-- One entry per session:
+### name (folder)
+- Doing: current task and state
+- Knows: what it has in context (repo, files, systems, decisions)
+- Give it: the kinds of tasks to delegate to it
+-->
+
 ## Standing instructions from the human
 
 ## Channels and what they're for
-
-## Sessions and what they're doing
 
 ## Decisions and open threads
 """
@@ -37,6 +44,11 @@ def bg_command(name: str, resume: str | None = None, role: str = "worker") -> li
     settings = json.loads(SETTINGS_FILE.read_text())
     settings["env"] = {"THUNDERHEAD_NAME": name, "THUNDERHEAD_LISTEN": "1",
                        "THUNDERHEAD_REMOTE_APPROVAL": "1", "THUNDERHEAD_ROLE": role}
+    if role == "lead":
+        # Its notebook is the one file The ThunderHead edits without asking; any other edit
+        # goes to the human for approval.
+        notes = f"//{NOTES.as_posix().lstrip('/')}"
+        settings["permissions"]["allow"] += [f"Edit({notes})", f"Write({notes})"]
     cmd = ["claude", "--bg"] + (["--resume", resume] if resume else [])
     return cmd + ["-n", name, "--settings", json.dumps(settings), f"--mcp-config={MCP_FILE}"]
 
