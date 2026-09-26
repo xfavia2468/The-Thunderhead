@@ -219,7 +219,7 @@ def permission_request(p):
 def session_end(p):
     with store.db() as conn:
         sess = store.get_session(conn, p["session_id"])
-        if sess and sess["status"] in ("stopped", "waking", "wiped", store.SLEEPING):
+        if sess and sess["status"] in ("stopped", "waking", "wiped", "deleted", store.SLEEPING):
             return None  # the bot shut it down on purpose; the board already shows why
         store.set_status(conn, p["session_id"], "ended")
         store.post(conn, p["session_id"], "session_end", p.get("reason", "") or "ended")

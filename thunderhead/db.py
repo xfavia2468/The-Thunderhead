@@ -124,6 +124,9 @@ CREATE TABLE IF NOT EXISTS needs_you_posts (
     created_at REAL
 );
 
+-- Sessions spawned as one-offs: deleted automatically once they finish and fall asleep.
+CREATE TABLE IF NOT EXISTS oneoffs (name TEXT PRIMARY KEY);
+
 -- #archived: one listing per archived session thread, removed when the thread comes back.
 CREATE TABLE IF NOT EXISTS archived_posts (
     thread_id  INTEGER PRIMARY KEY,
@@ -167,7 +170,9 @@ LEAD = "thunderhead"
 # Statuses that mean the session is no longer running. 'stopped' was paused on
 # purpose and a message wakes it; 'wiped' is a Thunderhead cleared by /wipe, which
 # nothing may resume.
-DEAD = ("ended", "gone", "stopped", "wiped")
+DEAD = ("ended", "gone", "stopped", "wiped", "deleted")
+# 'deleted' rows only remain to keep a deleted session's thread attached to its record (for
+# #archived and /cleanup). Name lookups skip them, so the name is free again.
 # Asleep after sitting idle: its process is shut down, but any message wakes it.
 # Not in DEAD, so it still counts as part of the fleet.
 SLEEPING = "sleeping"
@@ -208,7 +213,7 @@ def upsert_session(conn, sid, *, name, cwd, pid, listen, remote_approval, role="
     ts = now()
     # A resumed or cleared session keeps its name; reuse that name's thread.
     prev = conn.execute(
-        "SELECT thread_id FROM sessions WHERE name=? AND thread_id IS NOT NULL "
+        "SELECT thread_id FROM sessions WHERE name=? AND thread_id IS NOT NULL AND status != 'deleted' "
         "ORDER BY updated_at DESC LIMIT 1", (name,)).fetchone()
     conn.execute(
         """INSERT INTO sessions (id, name, cwd, pid, status, listen, remote_approval,
@@ -239,7 +244,14 @@ _CURRENT = f"ORDER BY status IN {DEAD}, created_at DESC LIMIT 1"
 
 
 def session_by_name(conn, name):
-    return conn.execute(f"SELECT * FROM sessions WHERE name=? {_CURRENT}", (name,)).fetchone()
+    return conn.execute(f"SELECT * FROM sessions WHERE name=? AND status != 'deleted' {_CURRENT}",
+                        (name,)).fetchone()
+
+
+def is_current(conn, row) -> bool:
+    """Whether this row is its name's current session (not an older one, and not deleted)."""
+    cur = session_by_name(conn, row["name"])
+    return cur is not None and cur["id"] == row["id"]
 
 
 def session_by_thread(conn, thread_id):

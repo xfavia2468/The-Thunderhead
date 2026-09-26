@@ -194,6 +194,7 @@ class Thunderhead(discord.Client):
         self.channels: dict[str, discord.TextChannel] = {}
         self.last_board = None
         self.waking: set[str] = set()
+        self.deleting: set[str] = set()
         self.wake_failed: dict[str, float] = {}  # session id -> time of last failed wake
 
     async def setup_hook(self):
@@ -385,6 +386,60 @@ class Thunderhead(discord.Client):
                     pass
                 conn.execute("DELETE FROM archived_posts WHERE thread_id=?", (thread_id,))
 
+    async def delete_session(self, name: str, keep_thread: bool, note: str = "") -> str:
+        """Delete a session for good: its process, Claude jobs, records and (unless kept) its thread."""
+        with store.db() as conn:
+            err = org.delete_check(conn, name)
+            if err:
+                return err
+            cur = store.session_by_name(conn, name)
+            store.set_status(conn, cur["id"], "stopped")  # keeps its SessionEnd hook quiet
+            ids = [r[0] for r in conn.execute("SELECT id FROM sessions WHERE name=?", (name,))]
+        # Stop it before touching its records, so its hooks don't run against a half-deleted session.
+        for sid in ids:
+            await run_claude(["claude", "stop", short_id(sid)])
+            await run_claude(["claude", "rm", short_id(sid)])
+        with store.db() as conn:
+            gone = org.forget_session(conn, name, keep_thread)
+            posts = [r[0] for r in conn.execute(
+                f"SELECT message_id FROM needs_you_posts WHERE session_id IN ({','.join('?' * len(gone['ids']))})",
+                gone["ids"])]
+            conn.execute(f"DELETE FROM needs_you_posts WHERE session_id IN ({','.join('?' * len(gone['ids']))})",
+                         gone["ids"])
+            listing = conn.execute("SELECT message_id FROM archived_posts WHERE thread_id=?",
+                                   (gone["thread_id"],)).fetchone()
+        for mid in posts:
+            try:
+                await (await self.channels[NEEDS_YOU].fetch_message(mid)).delete()
+            except discord.HTTPException:
+                pass
+        thread = None
+        if gone["thread_id"]:
+            try:
+                thread = self.get_channel(gone["thread_id"]) or await self.fetch_channel(gone["thread_id"])
+            except discord.HTTPException:
+                thread = None
+        if isinstance(thread, discord.Thread):
+            if keep_thread:
+                await thread.send(f"🗑️ **{name}** was deleted{note}. This thread is kept as its record.")
+                await self.archive(thread)
+            else:
+                if listing:
+                    try:
+                        await (await self.channels[ARCHIVED].fetch_message(listing["message_id"])).delete()
+                    except discord.HTTPException:
+                        pass
+                    with store.db() as conn:
+                        conn.execute("DELETE FROM archived_posts WHERE thread_id=?", (thread.id,))
+                try:
+                    # A thread started from a message shares its id; that's the 🆕 notice.
+                    await thread.parent.get_partial_message(thread.id).delete()
+                except discord.HTTPException:
+                    pass
+                await thread.delete()
+        what = "Its thread is kept and archived." if keep_thread else "Its thread is gone too."
+        return f"🗑️ Deleted **{name}**. {what} The name is free again."
+
     async def archive(self, thread):
         """Archive a finished session's thread. Nothing is lost; it unarchives if the session returns."""
         if isinstance(thread, discord.Thread) and not thread.archived:
@@ -478,7 +533,7 @@ class Thunderhead(discord.Client):
                 (time.time() - 3600, time.time() - 86400)).fetchall()
             lines, seen = [], set()
             for s in rows:
-                if s["name"] in seen or store.session_by_name(conn, s["name"])["id"] != s["id"]:
+                if s["name"] in seen or not store.is_current(conn, s):
                     continue  # older rows of a resumed session
                 seen.add(s["name"])
                 lines.append(self.session_line(conn, s))
@@ -579,9 +634,19 @@ class Thunderhead(discord.Client):
                 s = store.get_session(conn, sid)
                 if (s and s["status"] in store.DEAD and s["status"] != "wiped" and authoritative
                         and sid not in self.waking
-                        and store.session_by_name(conn, s["name"])["id"] == sid):
+                        and store.is_current(conn, s)):
                     to_wake.append(s)
 
+        with store.db() as conn:
+            done = [n for (n,) in conn.execute("SELECT name FROM oneoffs")
+                    if (store.session_by_name(conn, n) or {"status": None})["status"] in (store.SLEEPING, "ended", "gone")]
+        for name in done:
+            if name not in self.deleting:
+                self.deleting.add(name)
+                try:
+                    await self.delete_session(name, keep_thread=True, note=" automatically (it was a one-off and is done)")
+                finally:
+                    self.deleting.discard(name)
         for s in to_reap:
             await run_claude(["claude", "stop", short_id(s["id"])])
         for s in to_wake:
@@ -798,7 +863,7 @@ def resume_hint(sess) -> str:
 async def session_names(interaction, current: str):
     with store.db() as conn:
         names = [r["name"] for r in conn.execute(
-            "SELECT name FROM sessions GROUP BY name ORDER BY MAX(updated_at) DESC")]
+            "SELECT name FROM sessions WHERE status != 'deleted' GROUP BY name ORDER BY MAX(updated_at) DESC")]
     return [app_commands.Choice(name=n, value=n) for n in names if current.lower() in n.lower()][:25]
 
 
@@ -843,13 +908,14 @@ async def send(interaction: discord.Interaction, session: str, message: str):
 @bot.tree.command(description="Start a new background Claude session")
 @app_commands.describe(directory="Working directory (absolute or ~/...)", task="What the session should do",
                        name="Session name (letters, digits, - and _)", mode="Permission mode",
-                       team="Put it on this team as a dev, reporting to the team's supervisor")
+                       team="Put it on this team as a dev, reporting to the team's supervisor",
+                       oneoff="Delete it automatically once it's done and falls asleep (its thread is kept)")
 @app_commands.choices(mode=[app_commands.Choice(name=m, value=m)
                             for m in ("default", "acceptEdits", "auto", "plan")])
 @app_commands.autocomplete(team=team_names)
 async def spawn(interaction: discord.Interaction, directory: str, task: str,
                 name: str | None = None, mode: app_commands.Choice[str] | None = None,
-                team: str | None = None):
+                team: str | None = None, oneoff: bool = False):
     if not await owner_only(interaction):
         return
     cwd = Path(directory).expanduser()
@@ -887,9 +953,53 @@ async def spawn(interaction: discord.Interaction, directory: str, task: str,
                 org.undo_spawn(conn, team, name)
         await interaction.followup.send(f"Spawn failed:\n```\n{text}\n```", ephemeral=True)
         return
+    if oneoff:
+        with store.db() as conn:
+            conn.execute("INSERT OR IGNORE INTO oneoffs (name) VALUES (?)", (name,))
     where = f"team {team}'s channel" if team else f"#{FLEET}"
+    extra = " It's a one-off: it'll be deleted once it's done and falls asleep." if oneoff else ""
     await interaction.followup.send(f"🚀 Spawned **{name}** in `{cwd}`. Its thread appears in {where} "
-                                    f"once it starts.\n```\n{text}\n```", ephemeral=True)
+                                    f"once it starts.{extra}\n```\n{text}\n```", ephemeral=True)
+
+
+class ConfirmDelete(discord.ui.View):
+    def __init__(self, name: str, keep_thread: bool):
+        super().__init__(timeout=120)
+        self.name, self.keep_thread = name, keep_thread
+
+    async def interaction_check(self, interaction) -> bool:
+        return is_owner(interaction.user)
+
+    @discord.ui.button(label="Delete forever", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content=f"Deleting **{self.name}**…", view=None)
+        result = await bot.delete_session(self.name, self.keep_thread)
+        await interaction.edit_original_response(content=result)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled. Nothing was deleted.", view=None)
+
+
+@bot.tree.command(name="delete", description="Delete a session for good (asks you to confirm)")
+@app_commands.describe(session="The session to delete",
+                       keep_thread="Keep its Discord thread (archived) as a record")
+@app_commands.autocomplete(session=session_names)
+async def delete(interaction: discord.Interaction, session: str, keep_thread: bool = False):
+    if not await owner_only(interaction):
+        return
+    with store.db() as conn:
+        err = org.delete_check(conn, session)
+        sess = store.session_by_name(conn, session)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    busy = " It's **working right now**; deleting stops it mid-task." if sess["status"] in ("working", "needs_you") else ""
+    thread = "Its thread is kept and archived." if keep_thread else "Its thread and history in Discord go too."
+    await interaction.response.send_message(
+        f"Delete **{session}** for good?{busy}\nThis stops it, removes its Claude job and its fleet records, "
+        f"and frees the name. {thread} It can't be undone.",
+        view=ConfirmDelete(session, keep_thread), ephemeral=True)
 
 
 @bot.tree.command(description="Stop a background session (its conversation is kept)")
@@ -936,7 +1046,8 @@ async def cleanup(interaction: discord.Interaction, days: app_commands.Range[int
         rows = [s for s in conn.execute(
             f"SELECT * FROM sessions WHERE status IN {store.DEAD} AND updated_at < ? AND thread_id IS NOT NULL",
             (cutoff,)).fetchall()
-            if store.session_by_name(conn, s["name"])["id"] == s["id"] and store.rank(conn, s["name"])[0] in ("dev", "unteamed")]
+            if s["status"] == "deleted"
+            or (store.is_current(conn, s) and store.rank(conn, s["name"])[0] in ("dev", "unteamed"))]
     if not rows:
         await interaction.followup.send(f"No finished sessions older than {days} days.", ephemeral=True)
         return
@@ -962,7 +1073,8 @@ async def cleanup(interaction: discord.Interaction, days: app_commands.Range[int
                 except discord.NotFound:
                     pass
                 conn.execute("DELETE FROM archived_posts WHERE thread_id=?", (s["thread_id"],))
-            conn.execute("UPDATE sessions SET thread_id=NULL WHERE name=?", (s["name"],))
+            conn.execute("UPDATE sessions SET thread_id=NULL WHERE id=?", (s["id"],))
+            conn.execute("DELETE FROM sessions WHERE id=? AND status='deleted'", (s["id"],))
     await interaction.followup.send(f"🧹 Deleted {deleted} thread(s): {names}.", ephemeral=True)
 
 

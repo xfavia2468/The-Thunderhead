@@ -184,6 +184,45 @@ def undo_spawn(conn, team: str, name: str):
     conn.execute("DELETE FROM channel_members WHERE channel=? AND session_name=?", (team, name))
 
 
+def delete_check(conn, name) -> str | None:
+    """Why a session can't be deleted, or None if it can."""
+    if name == store.LEAD:
+        return "The Thunderhead can't be deleted. Use /wipe to give it a fresh start."
+    role, team = store.rank(conn, name)
+    if role == "supervisor":
+        return f"'{name}' supervises team '{team}'. Deleting it would leave the team without an owner."
+    if store.session_by_name(conn, name) is None:
+        return f"No session named '{name}'."
+    return None
+
+
+def forget_session(conn, name, keep_thread: bool) -> dict:
+    """Remove a session from the fleet's records. Returns what the caller must clean up outside the
+    store: its session ids (Claude jobs) and thread id.
+
+    keep_thread leaves one 'deleted' row holding the thread, so #archived and /cleanup still work.
+    """
+    rows = conn.execute("SELECT id, thread_id FROM sessions WHERE name=?", (name,)).fetchall()
+    ids = [r["id"] for r in rows]
+    thread_id = next((r["thread_id"] for r in rows if r["thread_id"]), None)
+    role, team = store.rank(conn, name)
+    marks = ",".join("?" * len(ids)) or "''"
+    conn.execute(f"DELETE FROM messages WHERE to_session IN ({marks})", ids)
+    conn.execute(f"UPDATE approvals SET status='expired', closed=1 WHERE status='pending' AND session_id IN ({marks})", ids)
+    for table in ("team_members", "channel_members", "channel_reads", "oneoffs"):
+        conn.execute(f"DELETE FROM {table} WHERE {'name' if table == 'oneoffs' else 'session_name'}=?", (name,))
+    if keep_thread and thread_id:
+        keep = next(r["id"] for r in rows if r["thread_id"] == thread_id)
+        conn.execute(f"DELETE FROM sessions WHERE name=? AND id != ?", (name, keep))
+        store.set_status(conn, keep, "deleted")
+    else:
+        conn.execute("DELETE FROM sessions WHERE name=?", (name,))
+    if role == "dev":
+        fyi(conn, store.get_team(conn, team)["supervisor"],
+            f"The human deleted your dev '{name}'. Drop it from your roster.")
+    return {"ids": ids, "thread_id": thread_id}
+
+
 # --- requests ---------------------------------------------------------------
 
 def describe(req) -> str:

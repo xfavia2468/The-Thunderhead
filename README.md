@@ -49,10 +49,11 @@ Re-run `setup_config.py` if you move the folder or change the timeouts.
 
 | | |
 |---|---|
-| `/spawn directory task [name] [mode] [team]` | Start a background session. It listens for messages and sends permission prompts to Discord. With `team`, it joins that team as a dev. |
+| `/spawn directory task [name] [mode] [team] [oneoff]` | Start a background session. It listens for messages and sends permission prompts to Discord. With `team`, it joins that team as a dev. With `oneoff:True`, it's deleted automatically once it's done and falls asleep; its thread is kept, archived, since it holds the result. |
 | Type in a session's thread | Message that session. 📨 means it's queued. |
 | `/send session message` | Same as above, from anywhere. |
 | `/status` | Quick list of sessions. The pinned message in `#fleet` stays up to date too. |
+| `/delete session [keep_thread]` | Delete a session for good, after you confirm: its process, Claude job, fleet records and (unless `keep_thread`) its thread. The name is free again. Not for The Thunderhead (use `/wipe`) or supervisors. |
 | `/stop session` | Pause a session on purpose. It shows as ⏹️ stopped, and other agents can't wake it. A message from you still does. |
 | Approve / Deny buttons in `#needs-you` | Answer a permission prompt. |
 | Type in `#thunderhead` | Talk to The Thunderhead, the lead session (below). Your first message there starts it. |
