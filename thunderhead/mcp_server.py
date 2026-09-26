@@ -1,6 +1,6 @@
 """Per-session MCP server: the tools a Claude session uses to talk to the fleet.
 
-Supervisors and The ThunderHead get extra tools on top. They're only registered
+Supervisors and The Thunderhead get extra tools on top. They're only registered
 when this server runs inside a session with that role, and each one checks the
 caller's place in the org chart again.
 """
@@ -88,7 +88,7 @@ def send(to: str, message: str) -> str:
         if target is None or (target["status"] in store.DEAD and not lead):
             names = ", ".join(s["name"] for s in store.live_sessions(conn) if s["id"] != me["id"])
             why = "was stopped" if target and target["status"] == "stopped" else "isn't running"
-            return (f"'{to}' {why}; only the human or The ThunderHead can restart it. "
+            return (f"'{to}' {why}; only the human or The Thunderhead can restart it. "
                     f"Sessions you can message: {names or 'none'}.")
         if target["id"] == me["id"]:
             return "That is you."
@@ -216,7 +216,7 @@ def inbox() -> str:
         return delivery(conn, me["id"], rows) if rows else "No new messages."
 
 
-# --- supervisors and The ThunderHead ----------------------------------------
+# --- supervisors and The Thunderhead ----------------------------------------
 
 def _require(conn, *roles):
     me = _me(conn)
@@ -233,8 +233,8 @@ def _outside_team(conn, names, team) -> list[str]:
 def create_channel(name: str, members: list[str], topic: str = "") -> str:
     """Create a group channel (also a Discord text channel) and add sessions to it. You're added too.
 
-    The ThunderHead can include anyone. A supervisor can create channels among its own team without
-    asking (The ThunderHead is told); a channel with other teams' sessions needs request("channel", ...).
+    The Thunderhead can include anyone. A supervisor can create channels among its own team without
+    asking (The Thunderhead is told); a channel with other teams' sessions needs request("channel", ...).
     """
     with store.db() as conn:
         me, role, team = _require(conn, "lead", "supervisor")
@@ -280,7 +280,7 @@ def propose_charter(text: str, summary: str) -> str:
 
 
 def request(action: str, details: dict, reason: str) -> str:
-    """Ask The ThunderHead to do something only it can do. It approves, rejects, or asks the human.
+    """Ask The Thunderhead to do something only it can do. It approves, rejects, or asks the human.
 
     action: "spawn" (details: directory, task, name) for a new dev on your team, "channel"
     (details: name, members, topic) for a channel with other teams' sessions, or "other"
@@ -291,7 +291,7 @@ def request(action: str, details: dict, reason: str) -> str:
         return org.create_request(conn, me, action, details, reason)
 
 
-# --- The ThunderHead only ---------------------------------------------------
+# --- The Thunderhead only ---------------------------------------------------
 
 def _lead(conn):
     return _require(conn, "lead")[0]
@@ -473,7 +473,7 @@ def emergency_stop(session: str, reason: str) -> str:
             store.set_status(conn, target["id"], target["status"])
         return f"Couldn't stop {session}:\n{text}"
     with store.db() as conn:
-        store.post(conn, target["id"], "stopped", f"🚨 Emergency stop by The ThunderHead: {reason}")
+        store.post(conn, target["id"], "stopped", f"🚨 Emergency stop by The Thunderhead: {reason}")
         store.post(conn, lead["id"], "report", f"🚨 I emergency-stopped **{session}**: {reason}")
         team = store.team_of(conn, session)
         if team is not None and team["supervisor"] != session:

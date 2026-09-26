@@ -26,4 +26,4 @@ Keep it short: a few lines, with pointers to files and commits rather than paste
 
 ## Who you hear from
 
-Your supervisor gives you work. The ThunderHead leads the fleet but works through supervisors. If it messages you directly, it's an emergency: do what it says. The human outranks everyone; if the human messages you directly, do what they ask. Your supervisor gets a copy automatically.
+Your supervisor gives you work. The Thunderhead leads the fleet but works through supervisors. If it messages you directly, it's an emergency: do what it says. The human outranks everyone; if the human messages you directly, do what they ask. Your supervisor gets a copy automatically.

@@ -97,7 +97,7 @@ class ApprovalButton(discord.ui.DynamicItem[discord.ui.Button],
 
 class RequestButton(discord.ui.DynamicItem[discord.ui.Button],
                     template=r"th:req:(?P<action>approve|reject):(?P<id>[0-9]+)"):
-    """Approve/Reject for a supervisor's request that The ThunderHead escalated to the human."""
+    """Approve/Reject for a supervisor's request that The Thunderhead escalated to the human."""
 
     def __init__(self, action: str, request_id: int):
         super().__init__(discord.ui.Button(
@@ -160,7 +160,7 @@ class Thunderhead(discord.Client):
         for name in (FLEET, NEEDS_YOU, CHATTER, LEAD_CHANNEL):
             ch = discord.utils.get(guild.text_channels, name=name)
             if ch is None:
-                topic = "Talk to The ThunderHead, the lead session. /wipe gives it a fresh start." \
+                topic = "Talk to The Thunderhead, the lead session. /wipe gives it a fresh start." \
                     if name == LEAD_CHANNEL else None
                 ch = await guild.create_text_channel(name, topic=topic)
                 log.info("Created #%s", name)
@@ -280,12 +280,12 @@ class Thunderhead(discord.Client):
             desk = await self.team_desk(conn, t["name"])
             await ch.send(f"👥 Team **{t['name']}** channel: its supervisor **{t['supervisor']}** and devs work "
                           f"together here. Devs' threads live here too. Talk to the supervisor in {desk.mention}.")
-            await desk.send(f"👥 Team **{t['name']}** was created by The ThunderHead. Its supervisor "
+            await desk.send(f"👥 Team **{t['name']}** was created by The Thunderhead. Its supervisor "
                             f"**{t['supervisor']}** is starting up and will introduce itself here.\n"
                             f"Repos: {', '.join(f'`{r}`' for r in json.loads(t['repos']))}")
         elif kind == "channel_created":
             row = store.get_channel(conn, ev["channel"])
-            await ch.send(f"📣 **#{ev['channel']}** was created by The ThunderHead."
+            await ch.send(f"📣 **#{ev['channel']}** was created by The Thunderhead."
                           + (f"\nTopic: {row['topic']}" if row["topic"] else "") + f"\n{body}\n"
                           "Everything posted here, by a member or by you, goes to every member.")
         elif kind == "channel_post":
@@ -293,7 +293,7 @@ class Thunderhead(discord.Client):
         elif kind == "channel_note":
             await ch.send(body)
         elif kind == "channel_closed":
-            await ch.send("🔒 This channel was closed by The ThunderHead. Sessions no longer receive posts here.")
+            await ch.send("🔒 This channel was closed by The Thunderhead. Sessions no longer receive posts here.")
             await ch.set_permissions(self.guild.default_role, send_messages=False)
 
     async def post_event(self, conn, ev):
@@ -318,10 +318,10 @@ class Thunderhead(discord.Client):
                 msg = await desk.send(f"<@{OWNER_ID}> Approve this charter? {req['from_name']}'s summary: "
                                       f"{req['reason'][:1200]}", view=view)
             else:
-                asker = "The ThunderHead wants" if req["from_name"] == store.LEAD else f"{req['from_name']} wants"
+                asker = "The Thunderhead wants" if req["from_name"] == store.LEAD else f"{req['from_name']} wants"
                 msg = await self.channels[LEAD_CHANNEL].send(
                     f"<@{OWNER_ID}> 📋 {asker} your call on a request:\n```\n{org.describe(req)[:1400]}\n```"
-                    + (f"ThunderHead's note: {req['note']}" if req["note"] else ""), view=view)
+                    + (f"Thunderhead's note: {req['note']}" if req["note"] else ""), view=view)
             conn.execute("UPDATE requests SET message_id=? WHERE id=?", (msg.id, req["id"]))
             return
         if kind == "report":
@@ -437,7 +437,7 @@ class Thunderhead(discord.Client):
                         and time.time() - mail[s["id"]][0] > 15):
                     to_wake.append(s)
 
-            # Stopped or ended sessions come back when the human or The ThunderHead writes to them.
+            # Stopped or ended sessions come back when the human or The Thunderhead writes to them.
             for sid, (_, authoritative) in mail.items():
                 s = store.get_session(conn, sid)
                 if (s and s["status"] in store.DEAD and s["status"] != "wiped" and authoritative
@@ -537,7 +537,7 @@ class Thunderhead(discord.Client):
                                     message.content, notify=mentioned or ["all"])
                 targets = [store.session_by_name(conn, n) for n in got]
             elif sess is None:
-                targets = None  # no ThunderHead yet
+                targets = None  # no Thunderhead yet
             else:
                 store.queue_message(conn, sess["id"], "human", message.author.display_name, message.content)
                 targets = [sess]
@@ -561,11 +561,11 @@ class Thunderhead(discord.Client):
             org.fyi(conn, sup, f"The human messaged your dev {name} directly: {text[:1500]}")
 
     async def start_lead(self, first_message: str | None = None) -> tuple[int, str]:
-        """Start a fresh ThunderHead: no earlier conversation, memory from hq/NOTES.md."""
+        """Start a fresh Thunderhead: no earlier conversation, memory from hq/NOTES.md."""
         cmd, cwd = lead_command(first_message)
         code, text = await run_claude(cmd, cwd=cwd)
         await self.channels[LEAD_CHANNEL].send(
-            "⚡ Starting a fresh ThunderHead…" if code == 0 else f"Couldn't start The ThunderHead:\n```\n{text}\n```")
+            "⚡ Starting a fresh Thunderhead…" if code == 0 else f"Couldn't start The Thunderhead:\n```\n{text}\n```")
         return code, text
 
     async def deliver_now(self, sess, message=None):
@@ -684,7 +684,7 @@ async def spawn(interaction: discord.Interaction, directory: str, task: str,
     name = name or f"{cwd.name or 'root'}-{secrets.token_hex(2)}"
     if not NAME_RE.match(name) or name == store.LEAD:
         await interaction.response.send_message("Names can only use letters, digits, - and _ "
-                                                "('thunderhead' is taken by The ThunderHead).", ephemeral=True)
+                                                "('thunderhead' is taken by The Thunderhead).", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -772,7 +772,7 @@ async def team_config(interaction: discord.Interaction, team: str,
     await interaction.response.send_message(result, ephemeral=True)
 
 
-@bot.tree.command(description="Give The ThunderHead a fresh start (its memory comes from hq/NOTES.md)")
+@bot.tree.command(description="Give The Thunderhead a fresh start (its memory comes from hq/NOTES.md)")
 async def wipe(interaction: discord.Interaction):
     if not await owner_only(interaction):
         return
@@ -786,9 +786,9 @@ async def wipe(interaction: discord.Interaction):
         await run_claude(["claude", "stop", short_id(lead["id"])])
         with store.db() as conn:
             store.set_status(conn, lead["id"], "wiped")
-    await bot.channels[LEAD_CHANNEL].send("🧹 **Wiped.** The ThunderHead's conversation was cleared.")
+    await bot.channels[LEAD_CHANNEL].send("🧹 **Wiped.** The Thunderhead's conversation was cleared.")
     code, text = await bot.start_lead()
-    await interaction.followup.send("Fresh ThunderHead starting." if code == 0 else f"Failed:\n```\n{text}\n```",
+    await interaction.followup.send("Fresh Thunderhead starting." if code == 0 else f"Failed:\n```\n{text}\n```",
                                     ephemeral=True)
 
 

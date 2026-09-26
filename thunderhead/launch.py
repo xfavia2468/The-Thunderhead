@@ -17,12 +17,12 @@ GENERATED = ("<!-- Generated from {src} each time this session starts. "
              "Edit that file in the THUNDERHEAD repo, not this copy. -->\n\n")
 MEMORY_GITIGNORE = "# Generated copies of the briefs in the THUNDERHEAD repo\nCLAUDE.md\n"
 
-LEAD_BOOT = """[thunderhead] You are The ThunderHead, starting fresh. Your earlier conversation was wiped.
+LEAD_BOOT = """[thunderhead] You are The Thunderhead, starting fresh. Your earlier conversation was wiped.
 Read NOTES.md now: it's your memory. Then call fleet() to see the current state, post a two-line \
 "back online" summary with report(), and handle the message below if there is one."""
 
 SUPERVISOR_BOOT = """[thunderhead] You are the supervisor of team '{team}', starting fresh.
-Your charter (in your CLAUDE.md and CHARTER.md) is a draft The ThunderHead wrote before anyone looked \
+Your charter (in your CLAUDE.md and CHARTER.md) is a draft The Thunderhead wrote before anyone looked \
 at the code. Get to know the product at the level of its architecture: read the repositories' own \
 CLAUDE.md and READMEs and the code's structure ({repos}), not every file, and write a map of the \
 product into NOTES.md. Then refine the charter against what you found and propose it to the human with \
@@ -45,7 +45,7 @@ Which other teams this one depends on, and which depend on it.
 ## The human's preferences for this product
 """
 
-NOTES_TEMPLATE = """# ThunderHead notes
+NOTES_TEMPLATE = """# Thunderhead notes
 
 Your memory across wipes. Keep it short and current: rewrite stale parts instead of only appending.
 
@@ -67,7 +67,7 @@ Your memory across wipes. Keep it short and current: rewrite stale parts instead
 ## Decisions and open threads
 """
 
-PERSONALITY_HEADER = """# The ThunderHead's personality
+PERSONALITY_HEADER = """# The Thunderhead's personality
 
 <!-- System personality: written by the human in briefs/thunderhead-personality.md (THUNDERHEAD
      repo) and copied here at every start, so edits to it here are overwritten.
@@ -180,7 +180,7 @@ def install_brief(folder, brief: str, extra: str = "") -> None:
 def sync_personality() -> str:
     """Refresh PERSONALITY.md: the system section from the brief, the dynamic section kept as written.
 
-    Returns the file's text, for inlining into The ThunderHead's CLAUDE.md.
+    Returns the file's text, for inlining into The Thunderhead's CLAUDE.md.
     """
     system = re.sub(r"<!--.*?-->", "", (BRIEFS / "thunderhead-personality.md").read_text(), flags=re.S).strip()
     dynamic = DYNAMIC_TEMPLATE
@@ -194,7 +194,7 @@ def sync_personality() -> str:
 
 
 def install_lead() -> None:
-    """The ThunderHead's folder: brief with its personality inlined, and its notes."""
+    """The Thunderhead's folder: brief with its personality inlined, and its notes."""
     ensure_memory()
     HQ.mkdir(parents=True, exist_ok=True)
     personality = sync_personality()
@@ -225,12 +225,12 @@ def prepare_supervisor(team) -> Path:
               else "DRAFT: refine it and propose it to the human with propose_charter()")
     install_brief(folder, "supervisor.md", extra=(
         f"\n\n---\n\n# Your team: {team['name']}\n\n"
-        f"## Settings (set by the human or The ThunderHead)\n\n"
+        f"## Settings (set by the human or The Thunderhead)\n\n"
         f"- **Autonomy: {team['autonomy']}.** " + (
             "Pick up work from your backlog on your own, within your charter."
             if team["autonomy"] == "act" else
             "Only work on what you're given. When a task is done, propose what to do next and wait for a yes.")
-        + f"\n- **Max devs: {team['max_devs']}.** Requests beyond this are refused; ask The ThunderHead "
+        + f"\n- **Max devs: {team['max_devs']}.** Requests beyond this are refused; ask The Thunderhead "
           "with a reason if the team needs more.\n\n"
         f"## Charter ({status})\n\n{charter}\n"))
     if not (folder / "NOTES.md").exists():
@@ -239,7 +239,7 @@ def prepare_supervisor(team) -> Path:
 
 
 def lead_command(first_message: str | None = None) -> tuple[list[str], str]:
-    """A fresh ThunderHead session: (command, working directory)."""
+    """A fresh Thunderhead session: (command, working directory)."""
     install_lead()
     prompt = LEAD_BOOT + (f"\n\n--- from the human (Discord) ---\n{first_message}" if first_message else "")
     return bg_command(store.LEAD, role="lead") + [prompt], str(HQ)

@@ -1,7 +1,7 @@
 """The org chart: teams, group channels and requests.
 
 Shared by the MCP tools and the bot, so an approved request does the same thing
-whether The ThunderHead approves it or the human does.
+whether The Thunderhead approves it or the human does.
 """
 import json
 import re
@@ -126,14 +126,14 @@ def create_team(conn, name: str, charter: str, repos: list[str], topic: str = ""
     conn.execute("INSERT INTO teams (name, topic, repos, supervisor, created_at, max_devs) VALUES (?, ?, ?, ?, ?, ?)",
                  (name, topic, json.dumps(folders), sup, store.now(), DEFAULT_MAX_DEVS))
     store.add_team_member(conn, name, sup)
-    # The team's own channel, for the supervisor and devs. No ThunderHead: it talks to the supervisor.
+    # The team's own channel, for the supervisor and devs. No Thunderhead: it talks to the supervisor.
     conn.execute("INSERT INTO channels (name, topic, created_by, created_at, team) VALUES (?, ?, ?, ?, ?)",
                  (name, topic or f"Team {name}", store.LEAD, store.now(), name))
     conn.execute("INSERT INTO channel_members (channel, session_name, added_at) VALUES (?, ?, ?)",
                  (name, sup, store.now()))
     if "## " not in charter:
         # Give the supervisor the template's sections to fill in as it refines the draft.
-        charter = f"## Summary from The ThunderHead\n\n{charter.strip()}\n\n{launch.CHARTER_TEMPLATE}"
+        charter = f"## Summary from The Thunderhead\n\n{charter.strip()}\n\n{launch.CHARTER_TEMPLATE}"
     launch.write_charter(name, charter)
     launch.prepare_supervisor(store.get_team(conn, name))
     lead = store.session_by_name(conn, store.LEAD)
@@ -199,14 +199,14 @@ def create_request(conn, me, action: str, params: dict, reason: str) -> str:
     if action not in REQUEST_ACTIONS:
         return f"action must be one of {', '.join(REQUEST_ACTIONS)}."
     if not reason.strip():
-        return "Say why: The ThunderHead needs a reason to approve it."
+        return "Say why: The Thunderhead needs a reason to approve it."
     need = {"spawn": ("directory", "task", "name"), "channel": ("name", "members")}.get(action, ())
     missing = [k for k in need if not params.get(k)]
     if missing:
         return f"A {action} request needs: {', '.join(missing)}."
     if action == "spawn" and store.dev_count(conn, team["name"]) >= team["max_devs"]:
         return (f"Your team is at its limit of {team['max_devs']} devs. If it really needs more, ask The "
-                "ThunderHead to raise the limit (request('other', ...) with your reason), or free up a dev.")
+                "Thunderhead to raise the limit (request('other', ...) with your reason), or free up a dev.")
     cur = conn.execute("INSERT INTO requests (from_name, team, action, params, reason, created_at) "
                        "VALUES (?, ?, ?, ?, ?, ?)",
                        (me["name"], team["name"], action, json.dumps(params), reason, store.now()))
@@ -216,7 +216,7 @@ def create_request(conn, me, action: str, params: dict, reason: str) -> str:
         store.queue_message(conn, lead["id"], "supervisor", me["name"],
                             f"New request {describe(req)}\n\nDecide with approve_request({req['id']}), "
                             f"reject_request({req['id']}, why) or escalate_request({req['id']}, note).", hops=1)
-    return f"Request #{req['id']} sent to The ThunderHead. You'll hear back when it's decided."
+    return f"Request #{req['id']} sent to The Thunderhead. You'll hear back when it's decided."
 
 
 def get_request(conn, req_id):
@@ -254,7 +254,7 @@ def decide(conn, req_id: int, approve: bool, note: str, by: str) -> tuple[str, l
     status = "approved" if approve else "rejected"
     conn.execute("UPDATE requests SET status=?, note=?, decided_at=? WHERE id=?",
                  (status, note, store.now(), req_id))
-    who = "the human" if by == "human" else "The ThunderHead"
+    who = "the human" if by == "human" else "The Thunderhead"
     outcome = f"Your request #{req_id} ({req['action']}) was {status} by {who}."
     if approve and req["action"] == "spawn":
         outcome += f" '{params['name']}' is starting and will report to you."
@@ -286,7 +286,7 @@ def apply_config(conn, team_name: str, changes: dict, by: str) -> str:
     for k, v in sets.items():
         conn.execute(f"UPDATE teams SET {k}=? WHERE name=?", (v, team_name))
     summary = ", ".join(f"{k}={v}" for k, v in sets.items())
-    who = "the human" if by == "human" else "The ThunderHead"
+    who = "the human" if by == "human" else "The Thunderhead"
     lead = store.session_by_name(conn, store.LEAD)
     store.post(conn, lead["id"] if lead else None, "report", f"⚙️ Team **{team_name}** settings changed by {who}: {summary}")
     notify(conn, "human" if by == "human" else store.LEAD, [team["supervisor"]],
@@ -301,7 +301,7 @@ def apply_config(conn, team_name: str, changes: dict, by: str) -> str:
 
 
 def request_config(conn, lead, team_name: str, changes: dict, reason: str) -> str:
-    """The ThunderHead changing a team's settings: tightening applies now, loosening goes to the human."""
+    """The Thunderhead changing a team's settings: tightening applies now, loosening goes to the human."""
     team = store.get_team(conn, team_name)
     if team is None:
         return f"No team '{team_name}'."

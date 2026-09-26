@@ -43,7 +43,7 @@ MAX_HOPS = int(os.environ.get("THUNDERHEAD_MAX_HOPS", 10))
 POLL_SECONDS = 1.5
 
 # Team defaults, and a fleet-wide ceiling on running sessions that only the human sets.
-# Per-team caps alone don't bound the total, since The ThunderHead can create teams.
+# Per-team caps alone don't bound the total, since The Thunderhead can create teams.
 DEFAULT_MAX_DEVS = int(os.environ.get("THUNDERHEAD_DEFAULT_MAX_DEVS", 3))
 MAX_SESSIONS = int(os.environ.get("THUNDERHEAD_MAX_SESSIONS", 10))
 

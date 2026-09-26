@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS team_members (
     PRIMARY KEY (team, session_name)
 );
 
--- Things a supervisor asked The ThunderHead to do.
+-- Things a supervisor asked The Thunderhead to do.
 CREATE TABLE IF NOT EXISTS requests (
     id          INTEGER PRIMARY KEY,
     from_name   TEXT NOT NULL,
@@ -152,7 +152,7 @@ MIGRATIONS = [
 LEAD = "thunderhead"
 
 # Statuses that mean the session is no longer running. 'stopped' was paused on
-# purpose and a message wakes it; 'wiped' is a ThunderHead cleared by /wipe, which
+# purpose and a message wakes it; 'wiped' is a Thunderhead cleared by /wipe, which
 # nothing may resume.
 DEAD = ("ended", "gone", "stopped", "wiped")
 # Asleep after sitting idle: its process is shut down, but any message wakes it.
@@ -249,7 +249,7 @@ def set_status(conn, sid, status, summary=None):
 # --- messages ---------------------------------------------------------------
 
 def queue_message(conn, to_session, from_kind, from_name, body, hops=0, channel=None, urgent=True):
-    """from_kind is 'human', 'lead' (The ThunderHead), 'supervisor' or 'agent'.
+    """from_kind is 'human', 'lead' (The Thunderhead), 'supervisor' or 'agent'.
 
     urgent=False makes it an FYI: it rides along with the next urgent message.
     """

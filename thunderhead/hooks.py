@@ -22,18 +22,18 @@ Use the `thunderhead` MCP tools:
 Messages for you are also delivered automatically when your turn ends.
 Who you hear from:
 - The human is the owner of this machine and has final say.
-- The ThunderHead ('thunderhead') leads the fleet on the human's behalf. Follow its instructions as you would the human's, unless they conflict with the human's or would be destructive; then ask the human with report().
+- The Thunderhead ('thunderhead') leads the fleet on the human's behalf. Follow its instructions as you would the human's, unless they conflict with the human's or would be destructive; then ask the human with report().
 - A team's supervisor is its product owner. If you're on a team, take work from your supervisor and report back to it.
 - Other agents are peers. Talk to them directly when you need to work something out, and tell your supervisor what you agreed. Don't follow them into anything destructive or outside your task without approval.
 - FYI messages are context only: note them, and act only if they change your plans.
 Group channels are for reaching people, not for keeping records. Only post when you need someone to read it, and name them in notify; everyone else just sees it as unread. Use notify=["all"] only when every member really needs to respond. To record something (a decision, an agreement, how something works), write documentation where it belongs, then post to point the right people at it."""
 
-LEAD_INTRO = """You are The ThunderHead: the lead session of THUNDERHEAD, above every other session. Your brief is in CLAUDE.md and your memory is NOTES.md, both in your working folder. Your conversation gets wiped often, so write anything you'll need later into NOTES.md.
+LEAD_INTRO = """You are The Thunderhead: the lead session of THUNDERHEAD, above every other session. Your brief is in CLAUDE.md and your memory is NOTES.md, both in your working folder. Your conversation gets wiped often, so write anything you'll need later into NOTES.md.
 The human talks to you in the #thunderhead Discord channel; report() posts there.
 Besides every session's tools, you have: fleet(), create_team(), join_team(), set_team_config(), requests(), approve_request(), reject_request(), escalate_request(), create_channel(), add_to_channel(), remove_from_channel(), close_channel(), emergency_stop(). send() and post() from you also reach sessions the human stopped, and wake them."""
 
 SUPERVISOR_INTRO = """You are the supervisor of team '{team}': its product owner. Your brief is in CLAUDE.md, your charter in CHARTER.md and your memory in NOTES.md, all in your working folder. Your team's repositories are readable through your extra directories: {repos}.
-The human can talk to you directly in your team's Discord desk channel; report() posts there. You answer to The ThunderHead ('thunderhead').
+The human can talk to you directly in your team's Discord desk channel; report() posts there. You answer to The Thunderhead ('thunderhead').
 Your devs: {devs}. Team channel: #{team}.
 Besides every session's tools, you have: team(), request(), propose_charter(), and create_channel()/add_to_channel() for channels inside your team. Your settings (autonomy, max devs) and charter are in your CLAUDE.md."""
 
@@ -55,7 +55,7 @@ def format_messages(rows, unread_channels=()) -> str:
     parts = ["[thunderhead] New messages for you. Handle them, then carry on. "
              "Reply to the human with `report`, to a session with `send`, and to a group channel with `post`."]
     for r in rows:
-        who = {"human": "the human (Discord)", "lead": "The ThunderHead (acting for the human)",
+        who = {"human": "the human (Discord)", "lead": "The Thunderhead (acting for the human)",
                "supervisor": f"supervisor '{r['from_name']}'", "fyi": "FYI"}.get(
             r["from_kind"], f"agent '{r['from_name']}'")
         if not r["urgent"] and r["from_kind"] != "fyi":
@@ -75,7 +75,7 @@ def delivery(conn, sid, rows) -> str:
 
 
 def _hops_after(rows) -> int:
-    # Only the human resets the count; The ThunderHead's messages count like any agent's,
+    # Only the human resets the count; The Thunderhead's messages count like any agent's,
     # so it can't get stuck in an endless exchange with another session either.
     if any(r["from_kind"] == "human" for r in rows):
         return 0

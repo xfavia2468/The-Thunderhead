@@ -10,8 +10,8 @@ Discord control plane for a fleet of Claude Code sessions. See README.md for wha
 - `thunderhead/bot.py`: Discord bot. Posts the outbox, writes your messages into `messages`, wakes and reaps sessions.
 - `hook.py`, `mcp_server.py`, `bot.py`: thin entry points. `setup_config.py` generates `config/*.json`.
 - `thunderhead/org.py`: the org chart (teams, channels, supervisors' requests), shared by the tools and the bot. `thunderhead/launch.py` builds every `claude` command line.
-- `briefs/`: standing briefs for The ThunderHead (`thunderhead.md`) and team supervisors (`supervisor.md`), plus The ThunderHead's system personality (`thunderhead-personality.md`, written by the user; don't change its content without being asked). The launcher copies a brief into the session's working folder as its CLAUDE.md at every start.
-- Memory lives outside this repo in `~/thunderhead-memory/` (`THUNDERHEAD_MEMORY`), a separate git repo the bot snapshots every 10 minutes: `hq/NOTES.md` is The ThunderHead's notebook, `teams/<team>/` each team's charter and notes. Don't commit memory here.
+- `briefs/`: standing briefs for The Thunderhead (`thunderhead.md`) and team supervisors (`supervisor.md`), plus The Thunderhead's system personality (`thunderhead-personality.md`, written by the user; don't change its content without being asked). The launcher copies a brief into the session's working folder as its CLAUDE.md at every start.
+- Memory lives outside this repo in `~/thunderhead-memory/` (`THUNDERHEAD_MEMORY`), a separate git repo the bot snapshots every 10 minutes: `hq/NOTES.md` is The Thunderhead's notebook, `teams/<team>/` each team's charter and notes. Don't commit memory here.
 
 ## Working on this repo
 
