@@ -4,23 +4,49 @@ Supervisors and The Thunderhead get extra tools on top. They're only registered
 when this server runs inside a session with that role, and each one checks the
 caller's place in the org chart again.
 """
+import functools
+import importlib
 import json
 import os
+from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
+from . import config, hooks, launch, org
 from . import db as store
-from . import launch, org
-from .config import MAX_HOPS
-from .hooks import _hops_after, delivery
 
 mcp = MCPServer("thunderhead", instructions="Talk to the human (via Discord) and to other Claude sessions.")
 
 STATES = ("working", "blocked", "done")
 # Posts per channel per minute before post() refuses, so a busy channel can't flood everyone.
 CHANNEL_RATE = 20
-HOPS_REFUSAL = (f"Refused: this chain of agent messages has gone {MAX_HOPS} hops without the human. "
-                "Use report() to ask the human how to proceed.")
+# A session loads this server once, when it starts, but the fleet's code changes while sessions run.
+# Before each tool call, reload the modules the tools rely on if they changed on disk, so a
+# long-running session (like The Thunderhead) never acts on stale logic. Changes to this file
+# itself, such as a new tool or new parameters, still need the session to restart.
+_RELOADABLE = (config, store, launch, hooks, org)  # in dependency order
+_loaded = {m.__name__: Path(m.__file__).stat().st_mtime for m in _RELOADABLE}
+
+
+def _refresh():
+    changed = [m for m in _RELOADABLE if Path(m.__file__).stat().st_mtime != _loaded[m.__name__]]
+    if changed:
+        for m in _RELOADABLE:  # reload them all, in order, so each sees the others' new code
+            importlib.reload(m)
+            _loaded[m.__name__] = Path(m.__file__).stat().st_mtime
+
+
+def tool(fn):
+    @functools.wraps(fn)
+    def fresh(*args, **kwargs):
+        _refresh()
+        return fn(*args, **kwargs)
+    return mcp.tool()(fresh)
+
+
+def hops_refusal() -> str:
+    return (f"Refused: this chain of agent messages has gone {config.MAX_HOPS} hops without the human. "
+            "Use report() to ask the human how to proceed.")
 
 
 def _me(conn):
@@ -46,12 +72,12 @@ def _hops(conn, me, recipients) -> int | None:
     if recipients and all(store.is_down(conn, me["name"], r) for r in recipients):
         return me["current_hops"]
     hops = me["current_hops"] + 1
-    return None if hops > MAX_HOPS else hops
+    return None if hops > config.MAX_HOPS else hops
 
 
 # --- every session ----------------------------------------------------------
 
-@mcp.tool()
+@tool
 def status(state: str, summary: str) -> str:
     """Update your status on the human's fleet board.
 
@@ -66,7 +92,7 @@ def status(state: str, summary: str) -> str:
     return "Status updated."
 
 
-@mcp.tool()
+@tool
 def report(message: str) -> str:
     """Send a message to the human in your Discord thread: results, questions, or anything they should see."""
     with store.db() as conn:
@@ -75,7 +101,7 @@ def report(message: str) -> str:
     return "Sent to the human."
 
 
-@mcp.tool()
+@tool
 def send(to: str, message: str) -> str:
     """Send a private message to another Claude session by name.
 
@@ -99,7 +125,7 @@ def send(to: str, message: str) -> str:
                     "In an emergency, use emergency_stop().")
         hops = _hops(conn, me, [to])
         if hops is None:
-            return HOPS_REFUSAL
+            return hops_refusal()
         store.queue_message(conn, target["id"], org._kind(conn, me["name"]), me["name"], message, hops=hops)
         store.post(conn, me["id"], "agent_msg", f"📤 to **{target['name']}** (hop {hops}): {message}")
         store.post(conn, target["id"], "agent_msg_in", f"📥 from **{me['name']}** (hop {hops}): {message}")
@@ -108,7 +134,7 @@ def send(to: str, message: str) -> str:
     return f"Queued for {to}."
 
 
-@mcp.tool()
+@tool
 def post(channel: str, message: str, notify: list[str]) -> str:
     """Post to a group channel to reach specific members. The human sees every post in Discord.
 
@@ -134,14 +160,14 @@ def post(channel: str, message: str, notify: list[str]) -> str:
         targets = [m for m in roster if m != me["name"]] if "all" in notify else notify
         hops = _hops(conn, me, targets)
         if hops is None:
-            return HOPS_REFUSAL
+            return hops_refusal()
         got = store.fan_out(conn, ch["name"], org._kind(conn, me["name"]), me["name"], message, notify, hops=hops)
         pinged = "everyone" if "all" in notify else ", ".join(f"@{n}" for n in got) or "nobody"
         store.post(conn, me["id"], "channel_post", f"→ {pinged}\n{message}", channel=ch["name"])
     return f"Posted to #{ch['name']}; notified {', '.join(got) or 'nobody'}."
 
 
-@mcp.tool()
+@tool
 def read_channel(channel: str, limit: int = 20) -> str:
     """Show a group channel's recent posts (including ones you weren't pinged on) and mark them read."""
     with store.db() as conn:
@@ -156,7 +182,7 @@ def read_channel(channel: str, limit: int = 20) -> str:
                        for r in rows)
 
 
-@mcp.tool()
+@tool
 def channels() -> str:
     """List the group channels you're in, with their topic, members and unread count."""
     with store.db() as conn:
@@ -171,7 +197,7 @@ def channels() -> str:
                      + (f", {unread[c['name']]} unread" if c["name"] in unread else "") for c, m in rows)
 
 
-@mcp.tool()
+@tool
 def sessions() -> str:
     """List the other sessions in the fleet with their team, status and what they are working on."""
     with store.db() as conn:
@@ -186,7 +212,7 @@ def sessions() -> str:
     return "\n".join(lines) or "No other live sessions."
 
 
-@mcp.tool()
+@tool
 def team() -> str:
     """Your team: supervisor, devs, their status, and the team channel."""
     with store.db() as conn:
@@ -205,15 +231,15 @@ def team() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@tool
 def inbox() -> str:
     """Check for new messages without waiting for your turn to end."""
     with store.db() as conn:
         me = _me(conn)
         rows = store.take_messages(conn, me["id"])
         if rows:
-            conn.execute("UPDATE sessions SET current_hops=? WHERE id=?", (_hops_after(rows), me["id"]))
-        return delivery(conn, me["id"], rows) if rows else "No new messages."
+            conn.execute("UPDATE sessions SET current_hops=? WHERE id=?", (hooks._hops_after(rows), me["id"]))
+        return hooks.delivery(conn, me["id"], rows) if rows else "No new messages."
 
 
 # --- supervisors and The Thunderhead ----------------------------------------
@@ -525,7 +551,7 @@ SUPERVISOR_TOOLS = (create_channel, add_to_channel, request, withdraw_request, p
 LEAD_TOOLS = (fleet, create_team, spawn_oneoff, join_team, set_team_config, requests, approve_request, reject_request, escalate_request,
               create_channel, add_to_channel, remove_from_channel, close_channel, emergency_stop)
 for fn in {"lead": LEAD_TOOLS, "supervisor": SUPERVISOR_TOOLS}.get(os.environ.get("THUNDERHEAD_ROLE"), ()):
-    mcp.tool()(fn)
+    tool(fn)
 
 
 def main():

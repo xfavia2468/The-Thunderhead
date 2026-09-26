@@ -545,11 +545,12 @@ class Thunderhead(discord.Client):
         message it continues in more, kept together and edited in place."""
         await self.clear_needs_you()
         with store.db() as conn:
-            # Live sessions, plus ones that just ended (an hour) or were stopped (a day). Older
-            # finished sessions are listed in #archived.
+            # Live sessions, plus ones that just ended (an hour) or were stopped (a day). A session
+            # whose thread is archived is listed in #archived instead, so each appears in one place.
             rows = conn.execute(
-                f"SELECT * FROM sessions WHERE status NOT IN {store.DEAD} OR updated_at > ? "
-                "OR (status='stopped' AND updated_at > ?) "
+                f"SELECT * FROM sessions WHERE (status NOT IN {store.DEAD} OR updated_at > ? "
+                "OR (status='stopped' AND updated_at > ?)) AND status != 'deleted' "
+                "AND (thread_id IS NULL OR thread_id NOT IN (SELECT thread_id FROM archived_posts)) "
                 f"ORDER BY status IN {store.DEAD}, created_at",
                 (time.time() - 3600, time.time() - 86400)).fetchall()
             lines, seen = [], set()
