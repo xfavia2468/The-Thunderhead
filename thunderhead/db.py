@@ -162,6 +162,7 @@ MIGRATIONS = [
     "ALTER TABLE teams ADD COLUMN autonomy TEXT DEFAULT 'propose'",
     "ALTER TABLE teams ADD COLUMN max_devs INTEGER DEFAULT 3",
     "ALTER TABLE teams ADD COLUMN charter_status TEXT DEFAULT 'draft'",
+    "ALTER TABLE oneoffs ADD COLUMN by_lead INTEGER DEFAULT 0",  # spawned by The Thunderhead
 ]
 
 # The lead session: its name, and the role that unlocks its tools.

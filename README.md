@@ -79,7 +79,7 @@ you ──▶ The Thunderhead ──▶ team supervisors ──▶ dev sessions
           (routes)          (product owners)      (do the work)
 ```
 
-- **The Thunderhead** (`#thunderhead`) is the lead. It knows which team owns what and routes your requests there. It never does hands-on work, and it never goes around a supervisor to reach its devs. It creates teams, decides supervisors' requests, and can stop any session in an emergency.
+- **The Thunderhead** (`#thunderhead`) is the lead. It knows which team owns what and routes your requests there. It never does hands-on work, and it never goes around a supervisor to reach its devs. It creates teams, decides supervisors' requests, and can stop any session in an emergency. For small, self-contained jobs that no team owns, it can start a **one-off** (`spawn_oneoff`). The one-off reports back and is deleted once done. At most 2 run at once (`THUNDERHEAD_MAX_ONEOFFS`), and each is announced in `#thunderhead`.
 - **A team** exists for each project or product domain. Its **supervisor** is the product owner: it knows the product in depth, reads the code without writing it, picks the right dev for each task and reviews the result.
 - **Devs** do the work. They take tasks from their supervisor and can talk to any other dev directly. When they agree on something, they document it in the product repo and point their supervisor at it.
 

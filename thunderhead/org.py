@@ -9,7 +9,9 @@ from pathlib import Path
 
 from . import db as store
 from . import launch
-from .config import DEFAULT_MAX_DEVS, MAX_SESSIONS
+import secrets
+
+from .config import DEFAULT_MAX_DEVS, MAX_ONEOFFS, MAX_SESSIONS
 
 # What supervisors can ask for. 'charter' and 'config' only the human can approve.
 REQUEST_ACTIONS = ("spawn", "channel", "other")
@@ -182,6 +184,36 @@ def spawn_dev(conn, team: str, directory: str, task: str, name: str) -> tuple[st
 def undo_spawn(conn, team: str, name: str):
     conn.execute("DELETE FROM team_members WHERE team=? AND session_name=?", (team, name))
     conn.execute("DELETE FROM channel_members WHERE channel=? AND session_name=?", (team, name))
+
+
+ONEOFF_BRIEF = """[thunderhead] You're a one-off session, started by The Thunderhead for a single task. You're not on a team.
+When you're done, send the result to The Thunderhead with send('thunderhead', ...): what you found or did, and how you know it's right (the commands you ran, their results). Keep it short, and point to files rather than pasting them. Then end your turn.
+Don't take on other work. Soon after you finish, you'll be deleted automatically; your Discord thread stays as the record.
+
+Your task:
+{task}"""
+
+
+def spawn_oneoff(conn, lead, directory: str, task: str, name: str = "") -> tuple[str | None, list[str], str, str]:
+    """Validate and register a one-off for The Thunderhead. Returns (error, command, folder, name)."""
+    cwd = Path(directory).expanduser()
+    if not cwd.is_dir():
+        return f"{cwd} is not a directory.", [], "", ""
+    if not task.strip():
+        return "Give the task.", [], "", ""
+    name = name or f"oneoff-{secrets.token_hex(2)}"
+    if not launch.NAME_RE.match(name) or name == store.LEAD or store.session_by_name(conn, name):
+        return f"The name '{name}' is taken or invalid.", [], "", ""
+    running = conn.execute("SELECT COUNT(*) FROM oneoffs WHERE by_lead=1").fetchone()[0]
+    if running >= MAX_ONEOFFS:
+        return (f"You already have {running} one-offs running (the limit is {MAX_ONEOFFS}). Wait for one to "
+                "finish, or ask the human.", [], "", "")
+    err = ceiling_error(conn)
+    if err:
+        return err, [], "", ""
+    conn.execute("INSERT INTO oneoffs (name, by_lead) VALUES (?, 1)", (name,))
+    store.post(conn, lead["id"], "report", f"🧩 Started one-off **{name}** in `{cwd}`: {task[:300]}")
+    return None, launch.bg_command(name) + [ONEOFF_BRIEF.format(task=task)], str(cwd), name
 
 
 def delete_check(conn, name) -> str | None:

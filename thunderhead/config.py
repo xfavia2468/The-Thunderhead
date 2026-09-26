@@ -46,6 +46,8 @@ POLL_SECONDS = 1.5
 # Per-team caps alone don't bound the total, since The Thunderhead can create teams.
 DEFAULT_MAX_DEVS = int(os.environ.get("THUNDERHEAD_DEFAULT_MAX_DEVS", 3))
 MAX_SESSIONS = int(os.environ.get("THUNDERHEAD_MAX_SESSIONS", 10))
+# One-off sessions The Thunderhead may have running at once (the human's own don't count).
+MAX_ONEOFFS = int(os.environ.get("THUNDERHEAD_MAX_ONEOFFS", 2))
 
 
 def flag(name: str) -> bool:

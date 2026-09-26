@@ -354,6 +354,25 @@ def create_team(name: str, charter: str, repos: list[str], topic: str = "", supe
     return f"Team '{t['name']}' created. Its supervisor '{sup}' is starting and will introduce itself."
 
 
+def spawn_oneoff(directory: str, task: str, name: str = "") -> str:
+    """Start a one-off session outside any team for a small, self-contained job that no team owns and
+    that won't need follow-up. It reports its result to you and is deleted automatically once done
+    (its thread stays as the record). At most a couple can run at once. Anything that belongs to a
+    team's product, or is ongoing, goes to that team's supervisor instead.
+    """
+    with store.db() as conn:
+        lead = _lead(conn)
+        err, cmd, cwd, name = org.spawn_oneoff(conn, lead, directory, task, name)
+        if err:
+            return err
+    code, text = launch.run(cmd, cwd=cwd)
+    if code != 0:
+        with store.db() as conn:
+            conn.execute("DELETE FROM oneoffs WHERE name=?", (name,))
+        return f"The one-off didn't start:\n{text}"
+    return f"Started one-off '{name}'. It will send you its result, then be deleted."
+
+
 def join_team(session: str, team: str) -> str:
     """Put an existing session without a team onto a team as a dev. It and its supervisor are told."""
     with store.db() as conn:
@@ -484,7 +503,7 @@ def emergency_stop(session: str, reason: str) -> str:
 
 
 SUPERVISOR_TOOLS = (create_channel, add_to_channel, request, propose_charter)
-LEAD_TOOLS = (fleet, create_team, join_team, set_team_config, requests, approve_request, reject_request, escalate_request,
+LEAD_TOOLS = (fleet, create_team, spawn_oneoff, join_team, set_team_config, requests, approve_request, reject_request, escalate_request,
               create_channel, add_to_channel, remove_from_channel, close_channel, emergency_stop)
 for fn in {"lead": LEAD_TOOLS, "supervisor": SUPERVISOR_TOOLS}.get(os.environ.get("THUNDERHEAD_ROLE"), ()):
     mcp.tool()(fn)
