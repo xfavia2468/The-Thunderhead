@@ -124,6 +124,12 @@ CREATE TABLE IF NOT EXISTS needs_you_posts (
     created_at REAL
 );
 
+-- #archived: one listing per archived session thread, removed when the thread comes back.
+CREATE TABLE IF NOT EXISTS archived_posts (
+    thread_id  INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL
+);
+
 -- Things a supervisor asked The Thunderhead to do.
 CREATE TABLE IF NOT EXISTS requests (
     id          INTEGER PRIMARY KEY,
@@ -312,7 +318,7 @@ def decide_approval(conn, approval_id, decision) -> bool:
 
 CHANNEL_RE = r"^[a-z0-9][a-z0-9-]{0,39}$"
 # Discord channels the bot already uses.
-RESERVED_CHANNELS = ("fleet", "needs-you", "agent-chatter", LEAD, "groups")
+RESERVED_CHANNELS = ("fleet", "needs-you", "agent-chatter", LEAD, "groups", "archived")
 
 
 def get_channel(conn, name):

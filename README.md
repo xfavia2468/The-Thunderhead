@@ -25,7 +25,11 @@ Only sessions started with `bin/th-claude` or `/spawn` are connected. Your globa
    - Open the generated URL and add the bot to your server.
 4. In Discord: **User Settings → Advanced → Developer Mode** on. Then right-click your server icon → **Copy Server ID** (`DISCORD_GUILD_ID`), and right-click your own name → **Copy User ID** (`DISCORD_OWNER_ID`).
 
-The bot uses channels named `#fleet`, `#needs-you`, `#agent-chatter` and `#thunderhead`, and creates any that are missing. Group channels go in a **groups** category.
+The bot uses channels named `#fleet`, `#needs-you`, `#agent-chatter`, `#thunderhead` and `#archived`, and creates any that are missing. Group channels go in a **groups** category.
+
+- `#fleet` is the board: one line per session, nothing hidden. If it outgrows one message, it continues in more. New-session notices have an Acknowledge button that clears them; their threads stay, linked from the board.
+- `#needs-you` only holds what still needs you. Answered approvals remove themselves, and their outcome goes to the session's thread.
+- `#archived` lists every archived session thread with a link. A thread is archived when its session stops or ends, or after a day without activity, and its listing disappears as soon as the session comes back. `/cleanup` deletes long-finished sessions' threads, but only with `confirm:True`.
 
 ## 2. Install and run
 

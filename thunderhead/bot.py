@@ -26,7 +26,7 @@ TOKEN = os.environ.get("DISCORD_TOKEN", "")
 GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0") or 0)
 OWNER_ID = int(os.environ.get("DISCORD_OWNER_ID", "0") or 0)
 
-FLEET, NEEDS_YOU, CHATTER, LEAD_CHANNEL = "fleet", "needs-you", "agent-chatter", store.LEAD
+FLEET, NEEDS_YOU, CHATTER, LEAD_CHANNEL, ARCHIVED = "fleet", "needs-you", "agent-chatter", store.LEAD, "archived"
 GROUPS = "groups"  # Discord category that holds the group channels
 ICONS = {"starting": "⏳", "working": "🟢", "listening": "🔵", "idle": "⚪",
          "needs_you": "🔴", "waking": "⏰", "sleeping": "💤", "stopped": "⏹️", "ended": "⚫", "gone": "⚫"}
@@ -56,6 +56,18 @@ async def send_long(channel, text: str, prefix: str = ""):
         return
     for part in chunks(text):
         await channel.send(part)
+
+
+def board_pages(lines: list[str]) -> list[str]:
+    """Split the board into Discord-sized messages at line boundaries. The first has the title."""
+    pages, page = [], "**⚡ THUNDERHEAD fleet**"
+    for line in lines or ["*No sessions yet.*"]:
+        line = line[:MSG_LIMIT - 40]
+        if len(page) + 1 + len(line) > MSG_LIMIT:
+            pages.append(page)
+            page = "**⚡ THUNDERHEAD fleet** (continued)"
+        page += "\n" + line
+    return pages + [page]
 
 
 def is_owner(user) -> bool:
@@ -195,11 +207,12 @@ class Thunderhead(discord.Client):
         if guild is None:
             log.error("Bot is not in guild %s. Check DISCORD_GUILD_ID and the invite.", GUILD_ID)
             return
-        for name in (FLEET, NEEDS_YOU, CHATTER, LEAD_CHANNEL):
+        for name in (FLEET, NEEDS_YOU, CHATTER, LEAD_CHANNEL, ARCHIVED):
             ch = discord.utils.get(guild.text_channels, name=name)
             if ch is None:
-                topic = "Talk to The Thunderhead, the lead session. /wipe gives it a fresh start." \
-                    if name == LEAD_CHANNEL else None
+                topic = {LEAD_CHANNEL: "Talk to The Thunderhead, the lead session. /wipe gives it a fresh start.",
+                         ARCHIVED: "Archived session threads. A listing disappears when its session comes back."
+                         }.get(name)
                 ch = await guild.create_text_channel(name, topic=topic)
                 log.info("Created #%s", name)
             self.channels[name] = ch
@@ -343,6 +356,35 @@ class Thunderhead(discord.Client):
             await ch.send("🔒 This channel was closed by The Thunderhead. Sessions no longer receive posts here.")
             await ch.set_permissions(self.guild.default_role, send_messages=False)
 
+    async def on_raw_thread_update(self, payload: discord.RawThreadUpdateEvent):
+        # Covers every way a thread changes: the bot archiving it, Discord's auto-archive after a
+        # quiet day, and it coming back when anything is posted. The raw event, because archived
+        # threads aren't cached and the plain one never fires for them.
+        archived = payload.data.get("thread_metadata", {}).get("archived")
+        if archived is not None:
+            await self.sync_archived(payload.thread_id, archived)
+
+    async def sync_archived(self, thread_id: int, archived: bool):
+        """Keep #archived listing exactly the archived session threads."""
+        with store.db() as conn:
+            sess = store.session_by_thread(conn, thread_id)
+            if sess is None or sess["thread_id"] != thread_id:
+                return  # not a session's thread
+            post = conn.execute("SELECT message_id FROM archived_posts WHERE thread_id=?", (thread_id,)).fetchone()
+            archived_ch = self.channels[ARCHIVED]
+            if archived and post is None:
+                msg = await archived_ch.send(
+                    f"🗄️ {self.session_line(conn, sess)}\nArchived <t:{int(time.time())}:R>. "
+                    "It comes back if the session wakes or anyone posts in it.")
+                conn.execute("INSERT INTO archived_posts (thread_id, message_id) VALUES (?, ?)", (thread_id, msg.id))
+            elif not archived and post is not None:
+                try:
+                    old = await archived_ch.fetch_message(post["message_id"])
+                    await old.delete()
+                except discord.NotFound:
+                    pass
+                conn.execute("DELETE FROM archived_posts WHERE thread_id=?", (thread_id,))
+
     async def archive(self, thread):
         """Archive a finished session's thread. Nothing is lost; it unarchives if the session returns."""
         if isinstance(thread, discord.Thread) and not thread.archived:
@@ -423,59 +465,65 @@ class Thunderhead(discord.Client):
 
     @tasks.loop(seconds=10)
     async def board(self):
-        """Keep one pinned message in #fleet showing every session."""
+        """Keep the board in #fleet: one line per session, nothing hidden. If it outgrows one
+        message it continues in more, kept together and edited in place."""
         await self.clear_needs_you()
         with store.db() as conn:
-            # Ended sessions stay listed for an hour, stopped ones (resumable) for a day.
+            # Live sessions, plus ones that just ended (an hour) or were stopped (a day). Older
+            # finished sessions are listed in #archived.
             rows = conn.execute(
                 f"SELECT * FROM sessions WHERE status NOT IN {store.DEAD} OR updated_at > ? "
                 "OR (status='stopped' AND updated_at > ?) "
                 f"ORDER BY status IN {store.DEAD}, created_at",
                 (time.time() - 3600, time.time() - 86400)).fetchall()
-            lines, seen, dozing = [], set(), []
+            lines, seen = [], set()
             for s in rows:
                 if s["name"] in seen or store.session_by_name(conn, s["name"])["id"] != s["id"]:
                     continue  # older rows of a resumed session
                 seen.add(s["name"])
-                if s["status"] == store.SLEEPING and s["updated_at"] < time.time() - 86400:
-                    dozing.append(s["name"])  # asleep over a day: one summary line, not one each
-                    continue
-                role, team = store.rank(conn, s["name"])
-                tag = {"lead": " 👑", "supervisor": f" [{team} · supervisor]", "dev": f" [{team}]"}.get(role, "")
-                where = f" · <#{s['thread_id']}>" if s["thread_id"] else ""
-                summary = f" — {s['summary'][:80]}" if s["summary"] else ""
-                lines.append(f"{ICONS.get(s['status'], '❔')} **{s['name']}**{tag} `{s['status']}`{summary}{where}")
-            if dozing:
-                shown = ", ".join(dozing[:8]) + (f" and {len(dozing) - 8} more" if len(dozing) > 8 else "")
-                lines.append(f"💤 {len(dozing)} asleep for over a day: {shown}")
-            # One page: drop whole lines from the end (keeping the sleepers' summary) rather than
-            # cutting one off mid-way.
-            if len("\n".join(lines)) > 1800:
-                tail = [lines.pop()] if dozing else []
-                more = ["…more in /status"]
-                while lines and len("\n".join(lines + tail + more)) > 1800:
-                    lines.pop()
-                lines += tail + more
-            text = "**⚡ THUNDERHEAD fleet**\n" + ("\n".join(lines) or "*No sessions yet.*")
-            if text == self.last_board:
+                lines.append(self.session_line(conn, s))
+            pages = board_pages(lines)
+            if pages == self.last_board:
                 return
-            msg_id = store.kv_get(conn, "board_message_id")
+            ids = json.loads(store.kv_get(conn, "board_message_ids") or "[]")
+            legacy = store.kv_get(conn, "board_message_id")
+            if not ids and legacy:
+                ids = [int(legacy)]
             fleet = self.channels[FLEET]
-            msg = None
-            if msg_id is not None:
+            msgs = []
+            for mid in ids:
                 try:
-                    msg = await fleet.fetch_message(int(msg_id))
-                    await msg.edit(content=text)
+                    msgs.append(await fleet.fetch_message(mid))
                 except discord.NotFound:
-                    msg = None
-            if msg is None:
-                msg = await fleet.send(text)
-                store.kv_set(conn, "board_message_id", msg.id)
+                    msgs = None
+                    break
+            if msgs is not None and len(msgs) == len(pages):
+                for msg, page in zip(msgs, pages):
+                    if msg.content != page:
+                        await msg.edit(content=page)
+                store.kv_set(conn, "board_message_ids", json.dumps([m.id for m in msgs]))
+            else:
+                # The page count changed: post the board afresh so its pages stay together.
+                for msg in msgs or []:
+                    try:
+                        await msg.delete()
+                    except discord.HTTPException:
+                        pass
+                msgs = [await fleet.send(page) for page in pages]
                 try:
-                    await msg.pin()
+                    await msgs[0].pin()
                 except discord.HTTPException:
                     pass
-            self.last_board = text
+                store.kv_set(conn, "board_message_ids", json.dumps([m.id for m in msgs]))
+                store.kv_set(conn, "board_message_id", msgs[0].id)
+            self.last_board = pages
+
+    def session_line(self, conn, s) -> str:
+        role, team = store.rank(conn, s["name"])
+        tag = {"lead": " 👑", "supervisor": f" [{team} · supervisor]", "dev": f" [{team}]"}.get(role, "")
+        where = f" · <#{s['thread_id']}>" if s["thread_id"] else ""
+        summary = f" — {s['summary']}" if s["summary"] else ""
+        return f"{ICONS.get(s['status'], '❔')} **{s['name']}**{tag} `{s['status']}`{summary}{where}"
 
     @tasks.loop(seconds=5)
     async def liveness(self):
@@ -602,12 +650,16 @@ class Thunderhead(discord.Client):
         """Once at startup: add Acknowledge to older session notices, and clear pin notices,
         so #fleet is just the board."""
         with store.db() as conn:
-            board_id = store.kv_get(conn, "board_message_id")
+            board_ids = set(json.loads(store.kv_get(conn, "board_message_ids") or "[]"))
+            board_ids.add(int(store.kv_get(conn, "board_message_id") or 0))
             team_ids = [r[0] for r in conn.execute(
                 "SELECT discord_id FROM channels WHERE team IS NOT NULL AND discord_id IS NOT NULL")]
         channels = [self.channels[FLEET]] + [ch for ch in map(self.get_channel, team_ids) if ch]
         for ch in channels:
+            async for thread in ch.archived_threads(limit=None):
+                await self.sync_archived(thread.id, True)
             for thread in ch.threads:  # active threads
+                await self.sync_archived(thread.id, False)
                 with store.db() as conn:
                     sess = store.session_by_thread(conn, thread.id)
                 try:
@@ -621,7 +673,7 @@ class Thunderhead(discord.Client):
                 try:
                     if msg.type == discord.MessageType.pins_add and msg.author == self.user:
                         await msg.delete()
-                    elif (msg.author == self.user and str(msg.id) != board_id
+                    elif (msg.author == self.user and msg.id not in board_ids
                           and msg.content.startswith("🆕") and not msg.components):
                         await msg.edit(view=ack_view())
                 except discord.HTTPException:
@@ -903,6 +955,13 @@ async def cleanup(interaction: discord.Interaction, days: app_commands.Range[int
         except discord.NotFound:
             pass
         with store.db() as conn:
+            post = conn.execute("SELECT message_id FROM archived_posts WHERE thread_id=?", (s["thread_id"],)).fetchone()
+            if post:
+                try:
+                    await (await bot.channels[ARCHIVED].fetch_message(post["message_id"])).delete()
+                except discord.NotFound:
+                    pass
+                conn.execute("DELETE FROM archived_posts WHERE thread_id=?", (s["thread_id"],))
             conn.execute("UPDATE sessions SET thread_id=NULL WHERE name=?", (s["name"],))
     await interaction.followup.send(f"🧹 Deleted {deleted} thread(s): {names}.", ephemeral=True)
 
