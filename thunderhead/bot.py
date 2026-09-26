@@ -310,9 +310,18 @@ class Thunderhead(discord.Client):
             view = discord.ui.View(timeout=None)
             view.add_item(RequestButton("approve", req["id"]))
             view.add_item(RequestButton("reject", req["id"]))
-            msg = await self.channels[LEAD_CHANNEL].send(
-                f"<@{OWNER_ID}> 📋 The ThunderHead wants your call on a request:\n```\n{org.describe(req)[:1400]}\n```"
-                + (f"ThunderHead's note: {req['note']}" if req["note"] else ""), view=view)
+            if req["action"] == "charter":
+                # Charters are between the human and the supervisor, so they go to the team's desk.
+                desk = await self.team_desk(conn, req["team"])
+                text = json.loads(req["params"])["text"]
+                await send_long(desk, text, prefix=f"📜 **Proposed charter for team {req['team']}**\n\n")
+                msg = await desk.send(f"<@{OWNER_ID}> Approve this charter? {req['from_name']}'s summary: "
+                                      f"{req['reason'][:1200]}", view=view)
+            else:
+                asker = "The ThunderHead wants" if req["from_name"] == store.LEAD else f"{req['from_name']} wants"
+                msg = await self.channels[LEAD_CHANNEL].send(
+                    f"<@{OWNER_ID}> 📋 {asker} your call on a request:\n```\n{org.describe(req)[:1400]}\n```"
+                    + (f"ThunderHead's note: {req['note']}" if req["note"] else ""), view=view)
             conn.execute("UPDATE requests SET message_id=? WHERE id=?", (msg.id, req["id"]))
             return
         if kind == "report":
@@ -736,6 +745,31 @@ async def stop(interaction: discord.Interaction, session: str):
         return
     await interaction.followup.send(f"⏹️ Stopped **{session}**. Its conversation is kept.\n{resume_hint(sess)}",
                                     ephemeral=True)
+
+
+@bot.tree.command(name="team-config", description="Set a team's autonomy and dev limit directly")
+@app_commands.describe(team="Team", autonomy="propose: works only on what it's given; act: picks up its own backlog",
+                       max_devs="The most devs the team may have")
+@app_commands.choices(autonomy=[app_commands.Choice(name=a, value=a) for a in org.AUTONOMY])
+@app_commands.autocomplete(team=team_names)
+async def team_config(interaction: discord.Interaction, team: str,
+                      autonomy: app_commands.Choice[str] | None = None,
+                      max_devs: app_commands.Range[int, 0, 20] | None = None):
+    if not await owner_only(interaction):
+        return
+    with store.db() as conn:
+        t = store.get_team(conn, team)
+        if t is None:
+            await interaction.response.send_message(f"No team `{team}`.", ephemeral=True)
+            return
+        if autonomy is None and max_devs is None:
+            await interaction.response.send_message(
+                f"**{team}**: autonomy={t['autonomy']}, max_devs={t['max_devs']} "
+                f"({store.dev_count(conn, team)} now), charter {t['charter_status']}", ephemeral=True)
+            return
+        result = org.apply_config(conn, team, {"autonomy": autonomy.value if autonomy else None,
+                                              "max_devs": max_devs}, by="human")
+    await interaction.response.send_message(result, ephemeral=True)
 
 
 @bot.tree.command(description="Give The ThunderHead a fresh start (its memory comes from hq/NOTES.md)")

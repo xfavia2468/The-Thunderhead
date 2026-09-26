@@ -9,8 +9,18 @@ from pathlib import Path
 
 from . import db as store
 from . import launch
+from .config import DEFAULT_MAX_DEVS, MAX_SESSIONS
 
+# What supervisors can ask for. 'charter' and 'config' only the human can approve.
 REQUEST_ACTIONS = ("spawn", "channel", "other")
+AUTONOMY = ("propose", "act")
+
+
+def ceiling_error(conn, adding=1) -> str | None:
+    if store.running_count(conn) + adding > MAX_SESSIONS:
+        return (f"The fleet is at its ceiling of {MAX_SESSIONS} running sessions "
+                "(THUNDERHEAD_MAX_SESSIONS, set by the human). Let some sleep or stop first.")
+    return None
 
 
 def _kind(conn, name) -> str:
@@ -110,15 +120,22 @@ def create_team(conn, name: str, charter: str, repos: list[str], topic: str = ""
     sup = supervisor or f"{name}-sup"
     if not launch.NAME_RE.match(sup) or store.session_by_name(conn, sup) or sup == store.LEAD:
         return f"The supervisor name '{sup}' is taken or invalid.", ""
-    conn.execute("INSERT INTO teams (name, topic, repos, supervisor, created_at) VALUES (?, ?, ?, ?, ?)",
-                 (name, topic, json.dumps(folders), sup, store.now()))
+    err = ceiling_error(conn)
+    if err:
+        return err, ""
+    conn.execute("INSERT INTO teams (name, topic, repos, supervisor, created_at, max_devs) VALUES (?, ?, ?, ?, ?, ?)",
+                 (name, topic, json.dumps(folders), sup, store.now(), DEFAULT_MAX_DEVS))
     store.add_team_member(conn, name, sup)
     # The team's own channel, for the supervisor and devs. No ThunderHead: it talks to the supervisor.
     conn.execute("INSERT INTO channels (name, topic, created_by, created_at, team) VALUES (?, ?, ?, ?, ?)",
                  (name, topic or f"Team {name}", store.LEAD, store.now(), name))
     conn.execute("INSERT INTO channel_members (channel, session_name, added_at) VALUES (?, ?, ?)",
                  (name, sup, store.now()))
-    launch.prepare_supervisor(name, charter)
+    if "## " not in charter:
+        # Give the supervisor the template's sections to fill in as it refines the draft.
+        charter = f"## Summary from The ThunderHead\n\n{charter.strip()}\n\n{launch.CHARTER_TEMPLATE}"
+    launch.write_charter(name, charter)
+    launch.prepare_supervisor(store.get_team(conn, name))
     lead = store.session_by_name(conn, store.LEAD)
     store.post(conn, lead["id"] if lead else None, "team_created", sup, channel=name)
     return None, sup
@@ -146,6 +163,12 @@ def spawn_dev(conn, team: str, directory: str, task: str, name: str) -> tuple[st
     cwd = Path(directory).expanduser()
     if not cwd.is_dir():
         return f"{cwd} is not a directory.", [], ""
+    t = store.get_team(conn, team)
+    if store.dev_count(conn, team) >= t["max_devs"]:
+        return f"Team '{team}' is at its limit of {t['max_devs']} devs.", [], ""
+    err = ceiling_error(conn)
+    if err:
+        return err, [], ""
     store.add_team_member(conn, team, name)
     conn.execute("INSERT OR IGNORE INTO channel_members (channel, session_name, added_at) VALUES (?, ?, ?)",
                  (team, name, store.now()))
@@ -153,7 +176,7 @@ def spawn_dev(conn, team: str, directory: str, task: str, name: str) -> tuple[st
     brief = (f"[thunderhead] You're a dev on team '{team}'. Your supervisor is '{sup}': it gives you work, and "
              f"you report back to it with send('{sup}', ...) when you finish or get stuck. Team channel: #{team}.\n\n"
              f"Your task:\n{task}")
-    return None, launch.bg_command(name) + [brief], str(cwd)
+    return None, launch.bg_command(name, dev=True) + [brief], str(cwd)
 
 
 def undo_spawn(conn, team: str, name: str):
@@ -181,6 +204,9 @@ def create_request(conn, me, action: str, params: dict, reason: str) -> str:
     missing = [k for k in need if not params.get(k)]
     if missing:
         return f"A {action} request needs: {', '.join(missing)}."
+    if action == "spawn" and store.dev_count(conn, team["name"]) >= team["max_devs"]:
+        return (f"Your team is at its limit of {team['max_devs']} devs. If it really needs more, ask The "
+                "ThunderHead to raise the limit (request('other', ...) with your reason), or free up a dev.")
     cur = conn.execute("INSERT INTO requests (from_name, team, action, params, reason, created_at) "
                        "VALUES (?, ?, ?, ?, ?, ?)",
                        (me["name"], team["name"], action, json.dumps(params), reason, store.now()))
@@ -205,8 +231,16 @@ def decide(conn, req_id: int, approve: bool, note: str, by: str) -> tuple[str, l
     req = get_request(conn, req_id)
     if req is None or req["status"] not in ("pending", "escalated"):
         return f"No open request #{req_id}.", None, ""
+    if req["action"] in ("charter", "config") and by != "human":
+        return f"Request #{req_id} ({req['action']}) is the human's to decide.", None, ""
     params = json.loads(req["params"])
     cmd, cwd, result = None, "", ""
+    if approve and req["action"] == "config":
+        result = apply_config(conn, req["team"], params, by="human")
+    elif approve and req["action"] == "charter":
+        launch.write_charter(req["team"], params["text"])
+        conn.execute("UPDATE teams SET charter_status='approved' WHERE name=?", (req["team"],))
+        result = "The charter is now in force; the supervisor loads it at its next start."
     if approve:
         if req["action"] == "spawn":
             err, cmd, cwd = spawn_dev(conn, req["team"], params["directory"], params["task"], params["name"])
@@ -226,7 +260,84 @@ def decide(conn, req_id: int, approve: bool, note: str, by: str) -> tuple[str, l
         outcome += f" '{params['name']}' is starting and will report to you."
     if note:
         outcome += f"\nNote: {note}"
-    notify(conn, store.LEAD if by != "human" else "human", [req["from_name"]], outcome)
+    if req["from_name"] != store.LEAD:
+        notify(conn, store.LEAD if by != "human" else "human", [req["from_name"]], outcome)
     if by == "human":
         fyi(conn, store.LEAD, f"The human {status} request #{req_id} from {req['from_name']}.")
     return f"Request #{req_id} {status}. {result}".strip(), cmd, cwd
+
+
+# --- team settings ----------------------------------------------------------
+
+def loosens(team, changes: dict) -> list[str]:
+    """Which changes give a team more room (these need the human's yes)."""
+    out = []
+    if changes.get("autonomy") == "act" and team["autonomy"] != "act":
+        out.append("autonomy → act")
+    if changes.get("max_devs") is not None and changes["max_devs"] > team["max_devs"]:
+        out.append(f"max_devs {team['max_devs']} → {changes['max_devs']}")
+    return out
+
+
+def apply_config(conn, team_name: str, changes: dict, by: str) -> str:
+    """Set a team's autonomy and/or max_devs, then tell the human and the supervisor."""
+    team = store.get_team(conn, team_name)
+    sets = {k: v for k, v in changes.items() if k in ("autonomy", "max_devs") and v is not None}
+    for k, v in sets.items():
+        conn.execute(f"UPDATE teams SET {k}=? WHERE name=?", (v, team_name))
+    summary = ", ".join(f"{k}={v}" for k, v in sets.items())
+    who = "the human" if by == "human" else "The ThunderHead"
+    lead = store.session_by_name(conn, store.LEAD)
+    store.post(conn, lead["id"] if lead else None, "report", f"⚙️ Team **{team_name}** settings changed by {who}: {summary}")
+    notify(conn, "human" if by == "human" else store.LEAD, [team["supervisor"]],
+           f"Your team's settings changed: {summary}. "
+           + ("With autonomy=act you may pick up backlog work on your own, within your charter."
+              if sets.get("autonomy") == "act" else
+              "With autonomy=propose, only work on what you're given and propose what's next."
+              if sets.get("autonomy") == "propose" else ""))
+    if by == "human":
+        fyi(conn, store.LEAD, f"The human changed team {team_name}'s settings: {summary}.")
+    return f"Team '{team_name}': {summary}."
+
+
+def request_config(conn, lead, team_name: str, changes: dict, reason: str) -> str:
+    """The ThunderHead changing a team's settings: tightening applies now, loosening goes to the human."""
+    team = store.get_team(conn, team_name)
+    if team is None:
+        return f"No team '{team_name}'."
+    if changes.get("autonomy") not in (None, *AUTONOMY):
+        return f"autonomy must be one of {', '.join(AUTONOMY)}."
+    if changes.get("max_devs") is not None and not 0 <= changes["max_devs"] <= 20:
+        return "max_devs must be between 0 and 20."
+    looser = loosens(team, changes)
+    tighter = {k: v for k, v in changes.items() if v is not None
+               and not (k == "autonomy" and v == "act") and not (k == "max_devs" and v > team["max_devs"])}
+    out = []
+    if tighter:
+        out.append(apply_config(conn, team_name, tighter, by=store.LEAD))
+    if looser:
+        wide = {k: v for k, v in changes.items() if v is not None and k not in tighter}
+        cur = conn.execute("INSERT INTO requests (from_name, team, action, params, reason, status, created_at) "
+                           "VALUES (?, ?, 'config', ?, ?, 'escalated', ?)",
+                           (lead["name"], team_name, json.dumps(wide), reason, store.now()))
+        store.post(conn, lead["id"], "request_escalated", str(cur.lastrowid))
+        out.append(f"Asked the human to approve {', '.join(looser)} (request #{cur.lastrowid}); "
+                   "giving a team more room needs their yes.")
+    return " ".join(out) or "Nothing to change."
+
+
+def propose_charter(conn, me, text: str, summary: str) -> str:
+    """A supervisor's charter, to the human for approval."""
+    team = store.team_of(conn, me["name"])
+    if team is None or team["supervisor"] != me["name"]:
+        return "Only a team's supervisor can propose its charter."
+    if len(text.strip()) < 40:
+        return "Give the full charter text, following the sections in your current draft."
+    conn.execute("UPDATE requests SET status='rejected', note='superseded' WHERE team=? AND action='charter' "
+                 "AND status='escalated'", (team["name"],))
+    cur = conn.execute("INSERT INTO requests (from_name, team, action, params, reason, status, created_at) "
+                       "VALUES (?, ?, 'charter', ?, ?, 'escalated', ?)",
+                       (me["name"], team["name"], json.dumps({"text": text}), summary, store.now()))
+    store.post(conn, me["id"], "request_escalated", str(cur.lastrowid))
+    fyi(conn, store.LEAD, f"{me['name']} proposed a charter for team {team['name']} to the human: {summary}")
+    return f"Charter sent to the human for approval (request #{cur.lastrowid}). Keep working from the draft meanwhile."

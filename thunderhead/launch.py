@@ -22,9 +22,28 @@ Read NOTES.md now: it's your memory. Then call fleet() to see the current state,
 "back online" summary with report(), and handle the message below if there is one."""
 
 SUPERVISOR_BOOT = """[thunderhead] You are the supervisor of team '{team}', starting fresh.
-Read CHARTER.md and NOTES.md in your folder. Then look over your team's repositories ({repos}) until you \
-understand the product well enough to plan work, and write what you learned into NOTES.md. Finally, \
-report() a short introduction: what the product is and what you'd do first."""
+Your charter (in your CLAUDE.md and CHARTER.md) is a draft The ThunderHead wrote before anyone looked \
+at the code. Get to know the product at the level of its architecture: read the repositories' own \
+CLAUDE.md and READMEs and the code's structure ({repos}), not every file, and write a map of the \
+product into NOTES.md. Then refine the charter against what you found and propose it to the human with \
+propose_charter(). Finally, report() a short introduction: what the product is and what you'd do first."""
+
+CHARTER_TEMPLATE = """## Scope
+What this team owns, and just as important, what it doesn't.
+
+## Goals and priorities
+
+## Definition of done
+The quality bar: which tests must pass, what review a change needs.
+
+## Constraints
+Things to never do or touch (production, other teams' code, spending, ...).
+
+## Interfaces
+Which other teams this one depends on, and which depend on it.
+
+## The human's preferences for this product
+"""
 
 NOTES_TEMPLATE = """# ThunderHead notes
 
@@ -101,7 +120,7 @@ def team_folder(team: str) -> Path:
 
 
 def bg_command(name: str, resume: str | None = None, role: str = "worker",
-               team: str | None = None, add_dirs=()) -> list[str]:
+               team: str | None = None, add_dirs=(), dev: bool = False) -> list[str]:
     """`claude --bg` connected to the fleet, listening, with approvals sent to Discord.
 
     `--resume` has to come straight after `--bg`, and `--mcp-config`/`--add-dir` take several
@@ -114,18 +133,27 @@ def bg_command(name: str, resume: str | None = None, role: str = "worker",
         _allow_edits(settings, NOTES, PERSONALITY)
     elif role == "supervisor" and team:
         _allow_edits(settings, team_folder(team) / "NOTES.md")
+        # The product repos' own CLAUDE.md is the best description of the product; Claude Code
+        # only loads it from --add-dir folders with this set.
+        settings["env"]["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
     cmd = ["claude", "--bg"] + (["--resume", resume] if resume else [])
     cmd += ["-n", name, "--settings", json.dumps(settings), f"--mcp-config={MCP_FILE}"]
+    if dev:
+        # How to be a dev in the fleet. A system-prompt addition rather than a CLAUDE.md, so the
+        # product repo stays untouched and it survives compaction.
+        cmd.append(f"--append-system-prompt-file={BRIEFS / 'dev.md'}")
     return cmd + [f"--add-dir={d}" for d in add_dirs]
 
 
 def relaunch_command(conn, sess, resume: str | None = None) -> list[str]:
     """The command that brings an existing session back with the same role, team and folders."""
     team = store.team_of(conn, sess["name"])
-    if sess["role"] == "supervisor" and team:
-        prepare_supervisor(team["name"])
+    if team and team["supervisor"] == sess["name"]:
+        prepare_supervisor(team)
         return bg_command(sess["name"], resume, role="supervisor", team=team["name"],
                           add_dirs=json.loads(team["repos"]))
+    if team:
+        return bg_command(sess["name"], resume, role=sess["role"], dev=True)
     if sess["role"] == "lead":
         install_lead()
     return bg_command(sess["name"], resume, role=sess["role"])
@@ -177,15 +205,36 @@ def install_lead() -> None:
         NOTES.write_text(NOTES_TEMPLATE)
 
 
-def prepare_supervisor(team: str, charter: str | None = None) -> Path:
-    """Set up a team's memory folder: brief, charter and notes."""
-    ensure_memory()
+def write_charter(team: str, text: str) -> None:
     folder = team_folder(team)
-    install_brief(folder, "supervisor.md")
-    if charter is not None:
-        (folder / "CHARTER.md").write_text(f"# Team {team}: charter\n\n{charter.strip()}\n")
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "CHARTER.md").write_text(f"# Team {team}: charter\n\n{text.strip()}\n")
+
+
+def prepare_supervisor(team) -> Path:
+    """Set up a team's memory folder: the brief with the charter and settings inlined, and notes.
+
+    `team` is its row in the store. The charter and settings go into CLAUDE.md so they're always
+    in context; NOTES.md stays a file the supervisor reads, since it changes constantly.
+    """
+    ensure_memory()
+    folder = team_folder(team["name"])
+    charter_file = folder / "CHARTER.md"
+    charter = charter_file.read_text().split("\n", 1)[-1].strip() if charter_file.exists() else "(none yet)"
+    status = ("APPROVED by the human" if team["charter_status"] == "approved"
+              else "DRAFT: refine it and propose it to the human with propose_charter()")
+    install_brief(folder, "supervisor.md", extra=(
+        f"\n\n---\n\n# Your team: {team['name']}\n\n"
+        f"## Settings (set by the human or The ThunderHead)\n\n"
+        f"- **Autonomy: {team['autonomy']}.** " + (
+            "Pick up work from your backlog on your own, within your charter."
+            if team["autonomy"] == "act" else
+            "Only work on what you're given. When a task is done, propose what to do next and wait for a yes.")
+        + f"\n- **Max devs: {team['max_devs']}.** Requests beyond this are refused; ask The ThunderHead "
+          "with a reason if the team needs more.\n\n"
+        f"## Charter ({status})\n\n{charter}\n"))
     if not (folder / "NOTES.md").exists():
-        (folder / "NOTES.md").write_text(SUPERVISOR_NOTES_TEMPLATE.format(team=team))
+        (folder / "NOTES.md").write_text(SUPERVISOR_NOTES_TEMPLATE.format(team=team["name"]))
     return folder
 
 
@@ -196,11 +245,13 @@ def lead_command(first_message: str | None = None) -> tuple[list[str], str]:
     return bg_command(store.LEAD, role="lead") + [prompt], str(HQ)
 
 
-def supervisor_command(team: str, name: str, repos: list[str]) -> tuple[list[str], str]:
-    """A fresh supervisor session for a team: (command, working directory)."""
+def supervisor_command(team) -> tuple[list[str], str]:
+    """A fresh supervisor session for a team (its row in the store): (command, working directory)."""
     folder = prepare_supervisor(team)
-    prompt = SUPERVISOR_BOOT.format(team=team, repos=", ".join(repos))
-    return bg_command(name, role="supervisor", team=team, add_dirs=repos) + [prompt], str(folder)
+    repos = json.loads(team["repos"])
+    prompt = SUPERVISOR_BOOT.format(team=team["name"], repos=", ".join(repos))
+    return (bg_command(team["supervisor"], role="supervisor", team=team["name"], add_dirs=repos) + [prompt],
+            str(folder))
 
 
 def run(cmd: list[str], cwd=None, timeout=60) -> tuple[int, str]:

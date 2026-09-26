@@ -141,6 +141,11 @@ MIGRATIONS = [
     # 0 = FYI: delivered with the next real message, never wakes the session on its own.
     "ALTER TABLE messages ADD COLUMN urgent INTEGER DEFAULT 1",
     "ALTER TABLE channels ADD COLUMN team TEXT",  # set for a team's own channels
+    # Team settings. autonomy: 'propose' (only works on what it's given, suggests what's next)
+    # or 'act' (picks up its own backlog). charter_status: 'draft' until the human approves it.
+    "ALTER TABLE teams ADD COLUMN autonomy TEXT DEFAULT 'propose'",
+    "ALTER TABLE teams ADD COLUMN max_devs INTEGER DEFAULT 3",
+    "ALTER TABLE teams ADD COLUMN charter_status TEXT DEFAULT 'draft'",
 ]
 
 # The lead session: its name, and the role that unlocks its tools.
@@ -393,6 +398,17 @@ def team_members_of(conn, team) -> list[str]:
 
 def all_teams(conn):
     return conn.execute("SELECT * FROM teams ORDER BY created_at").fetchall()
+
+
+def dev_count(conn, team) -> int:
+    t = get_team(conn, team)
+    return sum(1 for m in team_members_of(conn, team) if m != t["supervisor"])
+
+
+def running_count(conn) -> int:
+    """Sessions that are up (sleeping ones cost nothing, so they don't count)."""
+    return conn.execute(f"SELECT COUNT(DISTINCT name) FROM sessions WHERE status NOT IN {DEAD} "
+                        f"AND status != '{SLEEPING}'").fetchone()[0]
 
 
 def add_team_member(conn, team, session_name):

@@ -195,6 +195,8 @@ def team() -> str:
         if t is None:
             return "You're not on a team."
         lines = [f"Team {t['name']}: {t['topic'] or ''} (repos: {', '.join(json.loads(t['repos']))})",
+                 f"Settings: autonomy={t['autonomy']}, max_devs={t['max_devs']} "
+                 f"({store.dev_count(conn, t['name'])} now), charter {t['charter_status']}",
                  f"Team channel: #{t['name']}"]
         for name in store.team_members_of(conn, t["name"]):
             s = store.session_by_name(conn, name)
@@ -266,6 +268,17 @@ def add_to_channel(channel: str, sessions: list[str]) -> str:
     return f"Added {', '.join(new) or 'nobody new'} to #{channel}."
 
 
+def propose_charter(text: str, summary: str) -> str:
+    """Send your team's charter to the human for approval, once you've refined the draft.
+
+    text: the full charter, keeping the draft's sections. summary: what you changed and why, in a line or two.
+    Only the human can approve it; until then, keep working from the draft.
+    """
+    with store.db() as conn:
+        me, _, _ = _require(conn, "supervisor")
+        return org.propose_charter(conn, me, text, summary)
+
+
 def request(action: str, details: dict, reason: str) -> str:
     """Ask The ThunderHead to do something only it can do. It approves, rejects, or asks the human.
 
@@ -301,7 +314,8 @@ def fleet() -> str:
             members = store.team_members_of(conn, t["name"])
             teamed.update(members)
             lines.append(f"- {t['name']}: {t['topic'] or ''} (supervisor {t['supervisor']}; "
-                         f"repos: {', '.join(json.loads(t['repos']))})")
+                         f"repos: {', '.join(json.loads(t['repos']))}; autonomy={t['autonomy']}, "
+                         f"max_devs={t['max_devs']}, charter {t['charter_status']})")
             lines += [line(m) + (" (supervisor)" if m == t["supervisor"] else "") for m in members]
         if len(lines) == 1:
             lines.append("- none")
@@ -320,7 +334,9 @@ def fleet() -> str:
 def create_team(name: str, charter: str, repos: list[str], topic: str = "", supervisor: str = "") -> str:
     """Create a team for a project or domain and start its supervisor.
 
-    charter: what the team owns, its goals and anything the human specified. The supervisor keeps it.
+    charter: a first draft of the team's mandate: what it owns (and doesn't), goals, definition of
+    done, constraints, interfaces with other teams, and anything the human specified. The supervisor
+    refines it after exploring the code and proposes it to the human, who approves the final version.
     repos: the folders the team works in (the supervisor can read them). supervisor: its session name
     (default '<name>-sup'). The team gets a Discord category, a desk channel for talking to the
     supervisor, and a team channel.
@@ -331,7 +347,7 @@ def create_team(name: str, charter: str, repos: list[str], topic: str = "", supe
         if err:
             return err
         t = store.get_team(conn, name.lower())
-        cmd, cwd = launch.supervisor_command(t["name"], sup, json.loads(t["repos"]))
+        cmd, cwd = launch.supervisor_command(t)
     code, text = launch.run(cmd, cwd=cwd)
     if code != 0:
         return f"Team registered, but the supervisor didn't start:\n{text}"
@@ -390,6 +406,20 @@ def escalate_request(request_id: int, note: str) -> str:
         conn.execute("UPDATE requests SET status='escalated', note=? WHERE id=?", (note, request_id))
         store.post(conn, lead["id"], "request_escalated", str(request_id))
     return f"Request #{request_id} is with the human now."
+
+
+def set_team_config(team: str, reason: str, autonomy: str = "", max_devs: int = -1) -> str:
+    """Change a team's settings, as the human's instructions call for.
+
+    autonomy: "propose" (only works on what it's given, proposes what's next) or "act" (picks up its
+    own backlog). max_devs: the most devs the team may have. Tightening (propose, a lower cap) applies
+    at once. Loosening (act, a higher cap) goes to the human's Approve/Reject buttons: quote their
+    words in reason if they asked for it. The human and the supervisor are told either way.
+    """
+    with store.db() as conn:
+        lead = _lead(conn)
+        return org.request_config(conn, lead, team, {"autonomy": autonomy or None,
+                                                    "max_devs": max_devs if max_devs >= 0 else None}, reason)
 
 
 def remove_from_channel(channel: str, sessions: list[str]) -> str:
@@ -453,8 +483,8 @@ def emergency_stop(session: str, reason: str) -> str:
     return f"Stopped {session}. The human and its supervisor have been told."
 
 
-SUPERVISOR_TOOLS = (create_channel, add_to_channel, request)
-LEAD_TOOLS = (fleet, create_team, join_team, requests, approve_request, reject_request, escalate_request,
+SUPERVISOR_TOOLS = (create_channel, add_to_channel, request, propose_charter)
+LEAD_TOOLS = (fleet, create_team, join_team, set_team_config, requests, approve_request, reject_request, escalate_request,
               create_channel, add_to_channel, remove_from_channel, close_channel, emergency_stop)
 for fn in {"lead": LEAD_TOOLS, "supervisor": SUPERVISOR_TOOLS}.get(os.environ.get("THUNDERHEAD_ROLE"), ()):
     mcp.tool()(fn)
