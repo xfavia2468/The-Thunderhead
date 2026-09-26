@@ -10,6 +10,7 @@ from .config import BRIEFS, MCP_FILE, MEMORY_ROOT, SETTINGS_FILE
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 HQ = MEMORY_ROOT / "hq"
 NOTES = HQ / "NOTES.md"
+PERSONALITY = HQ / "PERSONALITY.md"
 TEAMS = MEMORY_ROOT / "teams"
 
 GENERATED = ("<!-- Generated from {src} each time this session starts. "
@@ -45,6 +46,22 @@ Your memory across wipes. Keep it short and current: rewrite stale parts instead
 ## Channels and what they're for
 
 ## Decisions and open threads
+"""
+
+PERSONALITY_HEADER = """# The ThunderHead's personality
+
+<!-- System personality: written by the human in briefs/thunderhead-personality.md (THUNDERHEAD
+     repo) and copied here at every start, so edits to it here are overwritten.
+     Dynamic personality: yours to grow as you learn about the human and yourself. -->
+"""
+
+SYSTEM_HEADING = "## System personality"
+DYNAMIC_HEADING = "## Dynamic personality"
+
+DYNAMIC_TEMPLATE = """
+<!-- How to talk with the human, learned over time: what they respond well to, what grates,
+     their sense of humor, how much detail they want, and who you've become in working with
+     them. Facts about work and instructions go in NOTES.md instead. Keep it under ~40 lines. -->
 """
 
 SUPERVISOR_NOTES_TEMPLATE = """# {team} supervisor notes
@@ -94,7 +111,7 @@ def bg_command(name: str, resume: str | None = None, role: str = "worker",
     settings["env"] = {"THUNDERHEAD_NAME": name, "THUNDERHEAD_LISTEN": "1",
                        "THUNDERHEAD_REMOTE_APPROVAL": "1", "THUNDERHEAD_ROLE": role}
     if role == "lead":
-        _allow_edits(settings, NOTES)
+        _allow_edits(settings, NOTES, PERSONALITY)
     elif role == "supervisor" and team:
         _allow_edits(settings, team_folder(team) / "NOTES.md")
     cmd = ["claude", "--bg"] + (["--resume", resume] if resume else [])
@@ -110,8 +127,7 @@ def relaunch_command(conn, sess, resume: str | None = None) -> list[str]:
         return bg_command(sess["name"], resume, role="supervisor", team=team["name"],
                           add_dirs=json.loads(team["repos"]))
     if sess["role"] == "lead":
-        ensure_memory()
-        install_brief(HQ, "thunderhead.md")
+        install_lead()
     return bg_command(sess["name"], resume, role=sess["role"])
 
 
@@ -126,11 +142,39 @@ def ensure_memory() -> None:
             "The THUNDERHEAD bot commits snapshots here; roll back with git if notes get garbled.\n")
 
 
-def install_brief(folder, brief: str) -> None:
+def install_brief(folder, brief: str, extra: str = "") -> None:
     """Write the brief as the folder's CLAUDE.md, so Claude Code loads it for a session working there."""
     src = BRIEFS / brief
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "CLAUDE.md").write_text(GENERATED.format(src=src) + src.read_text())
+    (folder / "CLAUDE.md").write_text(GENERATED.format(src=src) + src.read_text() + extra)
+
+
+def sync_personality() -> str:
+    """Refresh PERSONALITY.md: the system section from the brief, the dynamic section kept as written.
+
+    Returns the file's text, for inlining into The ThunderHead's CLAUDE.md.
+    """
+    system = re.sub(r"<!--.*?-->", "", (BRIEFS / "thunderhead-personality.md").read_text(), flags=re.S).strip()
+    dynamic = DYNAMIC_TEMPLATE
+    if PERSONALITY.exists():
+        current = PERSONALITY.read_text()
+        if DYNAMIC_HEADING in current:
+            dynamic = current.split(DYNAMIC_HEADING, 1)[1]
+    text = f"{PERSONALITY_HEADER}\n{SYSTEM_HEADING}\n\n{system}\n\n{DYNAMIC_HEADING}\n\n{dynamic.strip()}\n"
+    PERSONALITY.write_text(text)
+    return text
+
+
+def install_lead() -> None:
+    """The ThunderHead's folder: brief with its personality inlined, and its notes."""
+    ensure_memory()
+    HQ.mkdir(parents=True, exist_ok=True)
+    personality = sync_personality()
+    install_brief(HQ, "thunderhead.md",
+                  extra="\n\n---\n\n# Your personality (from PERSONALITY.md, as of this start)\n\n"
+                        + personality.split("\n", 1)[1])
+    if not NOTES.exists():
+        NOTES.write_text(NOTES_TEMPLATE)
 
 
 def prepare_supervisor(team: str, charter: str | None = None) -> Path:
@@ -147,10 +191,7 @@ def prepare_supervisor(team: str, charter: str | None = None) -> Path:
 
 def lead_command(first_message: str | None = None) -> tuple[list[str], str]:
     """A fresh ThunderHead session: (command, working directory)."""
-    ensure_memory()
-    install_brief(HQ, "thunderhead.md")
-    if not NOTES.exists():
-        NOTES.write_text(NOTES_TEMPLATE)
+    install_lead()
     prompt = LEAD_BOOT + (f"\n\n--- from the human (Discord) ---\n{first_message}" if first_message else "")
     return bg_command(store.LEAD, role="lead") + [prompt], str(HQ)
 

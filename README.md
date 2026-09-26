@@ -89,6 +89,11 @@ Its conversation gets wiped (`/wipe`), so it keeps only routing knowledge (which
 
 - `briefs/thunderhead.md` (this repo): its standing brief (role, powers, rules). Edit it to change how The ThunderHead behaves. It's copied into its working folder at every start.
 - `~/thunderhead-memory/hq/NOTES.md`: its own notebook. It reads it at every start and writes down anything worth keeping.
+- `~/thunderhead-memory/hq/PERSONALITY.md`: how it comes across to you, in two sections:
+  - **System personality** is yours. Write it in `briefs/thunderhead-personality.md` (this repo); it's copied in at every start, so The ThunderHead can't change it.
+  - **Dynamic personality** is The ThunderHead's, and it grows as it learns about you and itself.
+
+  Both are inlined into its CLAUDE.md at start, and the system section wins where they conflict. The personality is for talking to you; with other sessions it stays plain and brief.
 
 Supervisors hold the durable project knowledge, in `~/thunderhead-memory/teams/<team>/`:
 
