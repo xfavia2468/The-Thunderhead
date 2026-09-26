@@ -31,6 +31,9 @@ GROUPS = "groups"  # Discord category that holds the group channels
 ICONS = {"starting": "⏳", "working": "🟢", "listening": "🔵", "idle": "⚪",
          "needs_you": "🔴", "waking": "⏰", "sleeping": "💤", "stopped": "⏹️", "ended": "⚫", "gone": "⚫"}
 MSG_LIMIT = 1900
+# A quiet thread (say, a sleeping session's) drops out of the sidebar after a day. It's archived, not
+# deleted: board links still open it, and it comes back as soon as the session posts again.
+THREAD_ARCHIVE_MINUTES = 1440
 
 
 def chunks(text: str, limit: int = MSG_LIMIT):
@@ -91,8 +94,15 @@ class ApprovalButton(discord.ui.DynamicItem[discord.ui.Button],
             await interaction.response.send_message("Already answered or expired.", ephemeral=True)
             return
         outcome = "✅ Approved" if self.action == "allow" else "⛔ Denied"
-        await interaction.response.edit_message(
-            content=f"{interaction.message.content}\n**{outcome}**", view=None)
+        # Answered: it no longer needs you, so it leaves #needs-you and the outcome goes to the thread.
+        await interaction.response.defer()
+        await interaction.message.delete()
+        bot_ = interaction.client
+        with store.db() as conn:
+            ap = conn.execute("SELECT * FROM approvals WHERE id=?", (self.approval_id,)).fetchone()
+            sess = store.get_session(conn, ap["session_id"])
+            thread = await bot_.thread_for(conn, sess)
+        await thread.send(f"🔐 {outcome}: **{ap['tool_name']}**\n```json\n{ap['tool_input'][:1500]}\n```")
 
 
 class RequestButton(discord.ui.DynamicItem[discord.ui.Button],
@@ -222,11 +232,13 @@ class Thunderhead(discord.Client):
                 except discord.NotFound:
                     ch = None
             if ch is not None:
+                if isinstance(ch, discord.Thread) and ch.archived:
+                    await ch.edit(archived=False)
                 return ch
         # Devs get their thread in their team's channel; everyone else in #fleet.
         parent = await self.group_channel(conn, team["name"]) if team is not None else self.channels[FLEET]
         starter = await parent.send(f"🆕 **{sess['name']}** · `{sess['cwd']}`", view=ack_view())
-        thread = await starter.create_thread(name=sess["name"][:100], auto_archive_duration=10080)
+        thread = await starter.create_thread(name=sess["name"][:100], auto_archive_duration=THREAD_ARCHIVE_MINUTES)
         conn.execute("UPDATE sessions SET thread_id=? WHERE name=?", (thread.id, sess["name"]))
         return thread
 
@@ -256,11 +268,17 @@ class Thunderhead(discord.Client):
             # Approvals that timed out: take the buttons away.
             for ap in conn.execute("SELECT * FROM approvals WHERE status='expired' AND closed=0 "
                                    "AND message_id IS NOT NULL").fetchall():
+                sess = store.get_session(conn, ap["session_id"])
                 try:
-                    msg = await self.channels[NEEDS_YOU].fetch_message(ap["message_id"])
-                    await msg.edit(content=msg.content + "\n⌛ **Expired**: answer it in the terminal.", view=None)
+                    old = await self.channels[NEEDS_YOU].fetch_message(ap["message_id"])
+                    await old.delete()
                 except discord.HTTPException:
                     pass
+                msg = await self.channels[NEEDS_YOU].send(
+                    f"<@{OWNER_ID}> ⌛ **{sess['name']}**'s request to use **{ap['tool_name']}** expired in Discord. "
+                    f"It's now waiting in the terminal: `claude attach {short_id(sess['id'])}`", view=ack_view())
+                conn.execute("INSERT INTO needs_you_posts (message_id, session_id, created_at) VALUES (?, ?, ?)",
+                             (msg.id, sess["id"], store.now()))
                 conn.execute("UPDATE approvals SET closed=1 WHERE id=?", (ap["id"],))
 
     async def team_category(self, conn, team: str) -> discord.CategoryChannel:
@@ -325,6 +343,14 @@ class Thunderhead(discord.Client):
             await ch.send("🔒 This channel was closed by The Thunderhead. Sessions no longer receive posts here.")
             await ch.set_permissions(self.guild.default_role, send_messages=False)
 
+    async def archive(self, thread):
+        """Archive a finished session's thread. Nothing is lost; it unarchives if the session returns."""
+        if isinstance(thread, discord.Thread) and not thread.archived:
+            try:
+                await thread.edit(archived=True)
+            except discord.HTTPException:
+                log.warning("Couldn't archive thread %s", thread.id)
+
     async def post_event(self, conn, ev):
         sess = store.get_session(conn, ev["session_id"])
         if ev["channel"]:
@@ -361,13 +387,18 @@ class Thunderhead(discord.Client):
             await thread.send(f"🟢 Session started in {body}")
         elif kind == "session_end":
             await thread.send(f"⚫ Session ended: {body}")
+            await self.archive(thread)
         elif kind == "woken":
             await thread.send(f"⏰ {body}")
         elif kind == "stopped":
             await thread.send(f"⏹️ Stopped from Discord. {body}")
+            await self.archive(thread)
         elif kind == "needs_you":
             await thread.send(f"🔔 {body}")
-            await self.channels[NEEDS_YOU].send(f"<@{OWNER_ID}> 🔔 **{sess['name']}**: {body[:1500]} ({thread.mention})")
+            msg = await self.channels[NEEDS_YOU].send(
+                f"<@{OWNER_ID}> 🔔 **{sess['name']}**: {body[:1500]} ({thread.mention})", view=ack_view())
+            conn.execute("INSERT INTO needs_you_posts (message_id, session_id, created_at) VALUES (?, ?, ?)",
+                         (msg.id, sess["id"], store.now()))
         elif kind == "agent_msg":
             await send_long(thread, body)
             await send_long(self.channels[CHATTER], body, prefix=f"**{sess['name']}** ")
@@ -375,9 +406,25 @@ class Thunderhead(discord.Client):
             # Already in #agent-chatter from the sender's side; only the recipient's thread needs it.
             await send_long(thread, body)
 
+    async def clear_needs_you(self):
+        """Remove #needs-you notices for sessions that don't need the human any more."""
+        with store.db() as conn:
+            stale = conn.execute("SELECT p.message_id FROM needs_you_posts p JOIN sessions s ON s.id=p.session_id "
+                                 "WHERE s.status != 'needs_you'").fetchall()
+            for (message_id,) in stale:
+                try:
+                    msg = await self.channels[NEEDS_YOU].fetch_message(message_id)
+                    await msg.delete()
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException:
+                    continue
+                conn.execute("DELETE FROM needs_you_posts WHERE message_id=?", (message_id,))
+
     @tasks.loop(seconds=10)
     async def board(self):
         """Keep one pinned message in #fleet showing every session."""
+        await self.clear_needs_you()
         with store.db() as conn:
             # Ended sessions stay listed for an hour, stopped ones (resumable) for a day.
             rows = conn.execute(
@@ -385,20 +432,33 @@ class Thunderhead(discord.Client):
                 "OR (status='stopped' AND updated_at > ?) "
                 f"ORDER BY status IN {store.DEAD}, created_at",
                 (time.time() - 3600, time.time() - 86400)).fetchall()
-            lines, seen = [], set()
+            lines, seen, dozing = [], set(), []
             for s in rows:
                 if s["name"] in seen or store.session_by_name(conn, s["name"])["id"] != s["id"]:
                     continue  # older rows of a resumed session
                 seen.add(s["name"])
+                if s["status"] == store.SLEEPING and s["updated_at"] < time.time() - 86400:
+                    dozing.append(s["name"])  # asleep over a day: one summary line, not one each
+                    continue
                 role, team = store.rank(conn, s["name"])
                 tag = {"lead": " 👑", "supervisor": f" [{team} · supervisor]", "dev": f" [{team}]"}.get(role, "")
                 where = f" · <#{s['thread_id']}>" if s["thread_id"] else ""
-                summary = f" — {s['summary']}" if s["summary"] else ""
+                summary = f" — {s['summary'][:80]}" if s["summary"] else ""
                 lines.append(f"{ICONS.get(s['status'], '❔')} **{s['name']}**{tag} `{s['status']}`{summary}{where}")
+            if dozing:
+                shown = ", ".join(dozing[:8]) + (f" and {len(dozing) - 8} more" if len(dozing) > 8 else "")
+                lines.append(f"💤 {len(dozing)} asleep for over a day: {shown}")
+            # One page: drop whole lines from the end (keeping the sleepers' summary) rather than
+            # cutting one off mid-way.
+            if len("\n".join(lines)) > 1800:
+                tail = [lines.pop()] if dozing else []
+                more = ["…more in /status"]
+                while lines and len("\n".join(lines + tail + more)) > 1800:
+                    lines.pop()
+                lines += tail + more
             text = "**⚡ THUNDERHEAD fleet**\n" + ("\n".join(lines) or "*No sessions yet.*")
             if text == self.last_board:
                 return
-            text = text[:1950]
             msg_id = store.kv_get(conn, "board_message_id")
             fleet = self.channels[FLEET]
             msg = None
@@ -547,6 +607,16 @@ class Thunderhead(discord.Client):
                 "SELECT discord_id FROM channels WHERE team IS NOT NULL AND discord_id IS NOT NULL")]
         channels = [self.channels[FLEET]] + [ch for ch in map(self.get_channel, team_ids) if ch]
         for ch in channels:
+            for thread in ch.threads:  # active threads
+                with store.db() as conn:
+                    sess = store.session_by_thread(conn, thread.id)
+                try:
+                    if sess is not None and sess["status"] in store.DEAD:
+                        await thread.edit(archived=True)
+                    elif thread.auto_archive_duration != THREAD_ARCHIVE_MINUTES:
+                        await thread.edit(auto_archive_duration=THREAD_ARCHIVE_MINUTES)
+                except discord.HTTPException:
+                    log.warning("Couldn't tidy thread %s", thread.id)
             async for msg in ch.history(limit=200):
                 try:
                     if msg.type == discord.MessageType.pins_add and msg.author == self.user:
@@ -798,6 +868,43 @@ async def stop(interaction: discord.Interaction, session: str):
         return
     await interaction.followup.send(f"⏹️ Stopped **{session}**. Its conversation is kept.\n{resume_hint(sess)}",
                                     ephemeral=True)
+
+
+@bot.tree.command(description="Delete threads of sessions that ended a while ago (asks before deleting)")
+@app_commands.describe(days="Only sessions that ended at least this many days ago",
+                       confirm="Leave off to see what would be deleted; set to True to delete")
+async def cleanup(interaction: discord.Interaction, days: app_commands.Range[int, 1, 3650] = 30,
+                  confirm: bool = False):
+    if not await owner_only(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    cutoff = time.time() - days * 86400
+    with store.db() as conn:
+        # Current row per name, finished, idle past the cutoff, with a thread of its own (not a desk).
+        rows = [s for s in conn.execute(
+            f"SELECT * FROM sessions WHERE status IN {store.DEAD} AND updated_at < ? AND thread_id IS NOT NULL",
+            (cutoff,)).fetchall()
+            if store.session_by_name(conn, s["name"])["id"] == s["id"] and store.rank(conn, s["name"])[0] in ("dev", "unteamed")]
+    if not rows:
+        await interaction.followup.send(f"No finished sessions older than {days} days.", ephemeral=True)
+        return
+    names = ", ".join(s["name"] for s in rows)
+    if not confirm:
+        await interaction.followup.send(f"Would delete {len(rows)} thread(s): {names}.\n"
+                                        f"This can't be undone. Run `/cleanup days:{days} confirm:True` to do it.",
+                                        ephemeral=True)
+        return
+    deleted = 0
+    for s in rows:
+        try:
+            thread = bot.get_channel(s["thread_id"]) or await bot.fetch_channel(s["thread_id"])
+            await thread.delete()
+            deleted += 1
+        except discord.NotFound:
+            pass
+        with store.db() as conn:
+            conn.execute("UPDATE sessions SET thread_id=NULL WHERE name=?", (s["name"],))
+    await interaction.followup.send(f"🧹 Deleted {deleted} thread(s): {names}.", ephemeral=True)
 
 
 @bot.tree.command(name="team-config", description="Set a team's autonomy and dev limit directly")

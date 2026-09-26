@@ -117,6 +117,13 @@ CREATE TABLE IF NOT EXISTS team_members (
     PRIMARY KEY (team, session_name)
 );
 
+-- #needs-you notices, removed once their session no longer needs the human.
+CREATE TABLE IF NOT EXISTS needs_you_posts (
+    message_id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    created_at REAL
+);
+
 -- Things a supervisor asked The Thunderhead to do.
 CREATE TABLE IF NOT EXISTS requests (
     id          INTEGER PRIMARY KEY,
