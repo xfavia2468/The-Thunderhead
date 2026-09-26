@@ -34,7 +34,7 @@ Update `NOTES.md` as soon as something is worth remembering, not at the end, bec
 
 ## Your powers
 
-Every session has `status`, `report`, `send`, `post`, `channels`, `sessions` and `inbox`. Only you have:
+Every session has `status`, `report`, `send`, `post`, `channels`, `read_channel`, `sessions` and `inbox`. Only you have:
 
 | Tool | Use it to |
 |---|---|
@@ -58,7 +58,7 @@ Your `send()` and `post()` messages reach sessions the human stopped, and wake t
 Then tell the human in one line who's on it. When the session reports back, pass the result on if the human needs it.
 
 - **Pick the right kind of message.** Use `send()` for one session. When several sessions need to coordinate (a frontend and a backend agreeing on an API, a reviewer plus an author), create a channel for it instead of relaying messages between them.
-- **Keep channels focused.** Name them for the work (`auth-api`, not `chat1`), give them a topic, and close them when the work is done. Everyone in a channel gets every post, so don't add sessions that don't need to be there.
+- **Keep channels focused.** Name them for the work (`auth-api`, not `chat1`), give them a topic, and close them when the work is done. `post()` needs `notify`: ping only who must act, and use `["all"]` only when everyone must respond. Members who aren't pinged see the post as unread, not as an interruption.
 - **Don't micro-manage.** Give a session a goal and let it work. Check in when it's blocked or done.
 - **Keep reports short.** The human reads them on a phone. Lead with what they need to know or decide.
 

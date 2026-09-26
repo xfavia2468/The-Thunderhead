@@ -83,6 +83,22 @@ CREATE TABLE IF NOT EXISTS channel_members (
     added_at     REAL,
     PRIMARY KEY (channel, session_name)
 );
+-- Every post, whoever was notified. Members not notified can read it here.
+CREATE TABLE IF NOT EXISTS channel_log (
+    id         INTEGER PRIMARY KEY,
+    channel    TEXT NOT NULL,
+    from_kind  TEXT NOT NULL,
+    from_name  TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    notified   TEXT NOT NULL,           -- JSON list of session names that were pinged
+    created_at REAL
+);
+CREATE TABLE IF NOT EXISTS channel_reads (
+    channel      TEXT NOT NULL,
+    session_name TEXT NOT NULL,
+    last_id      INTEGER NOT NULL,
+    PRIMARY KEY (channel, session_name)
+);
 """
 
 # Columns added after the first release. Each runs once; "duplicate column" means done.
@@ -266,18 +282,47 @@ def channels_of(conn, session_name) -> list[str]:
         "WHERE m.session_name=? AND c.closed=0 ORDER BY c.created_at", (session_name,))]
 
 
-def fan_out(conn, channel, from_kind, from_name, body, hops=0) -> list[str]:
-    """Queue a channel post for every member except the sender. Returns who got it."""
+def fan_out(conn, channel, from_kind, from_name, body, notify, hops=0) -> list[str]:
+    """Log a channel post, and deliver it to the members in `notify` ("all" means every member).
+
+    Members who weren't notified aren't interrupted; they see it as unread. Returns who was notified.
+    """
+    everyone = [m for m in members(conn, channel) if from_kind == "human" or m != from_name]
+    wanted = everyone if "all" in notify else [m for m in everyone if m in notify]
     got = []
-    for name in members(conn, channel):
-        if from_kind != "human" and name == from_name:
-            continue
+    for name in wanted:
         target = session_by_name(conn, name)
-        if target is None:
-            continue
-        queue_message(conn, target["id"], from_kind, from_name, body, hops=hops, channel=channel)
-        got.append(name)
+        if target is not None:
+            queue_message(conn, target["id"], from_kind, from_name, body, hops=hops, channel=channel)
+            got.append(name)
+    conn.execute("INSERT INTO channel_log (channel, from_kind, from_name, body, notified, created_at) "
+                 "VALUES (?, ?, ?, ?, ?, ?)", (channel, from_kind, from_name, body, json.dumps(got), now()))
     return got
+
+
+def unread(conn, session_name) -> list[tuple[str, int]]:
+    """(channel, count) of posts this session wasn't notified of and hasn't read."""
+    out = []
+    for ch in channels_of(conn, session_name):
+        row = conn.execute("SELECT last_id FROM channel_reads WHERE channel=? AND session_name=?",
+                           (ch, session_name)).fetchone()
+        posts = conn.execute("SELECT from_name, notified FROM channel_log WHERE channel=? AND id>?",
+                             (ch, row["last_id"] if row else 0)).fetchall()
+        n = sum(1 for p in posts if p["from_name"] != session_name and session_name not in json.loads(p["notified"]))
+        if n:
+            out.append((ch, n))
+    return out
+
+
+def read_log(conn, channel, session_name, limit=20):
+    """The channel's last `limit` posts, marking everything up to now as read."""
+    rows = conn.execute("SELECT * FROM channel_log WHERE channel=? ORDER BY id DESC LIMIT ?",
+                        (channel, limit)).fetchall()[::-1]
+    if rows:
+        conn.execute("INSERT INTO channel_reads (channel, session_name, last_id) VALUES (?, ?, ?) "
+                     "ON CONFLICT(channel, session_name) DO UPDATE SET last_id=excluded.last_id",
+                     (channel, session_name, rows[-1]["id"]))
+    return rows
 
 
 def recent_posts(conn, channel, seconds=60) -> int:

@@ -17,14 +17,14 @@ Use the `thunderhead` MCP tools:
 - status(state, summary): call when you start a task, get blocked, or finish. state is one of working, blocked, done.
 - report(message): send results, questions or anything the human should see. Keep it short; put long output in a file and give the path.
 - send(to, message): message another session by name. sessions() lists them.
-- post(channel, message): post to a group channel you're a member of; every member gets it. channels() lists yours.
+- post(channel, message, notify): post to a group channel you're in, pinging the members in notify. channels() lists yours; read_channel() shows recent posts.
 - inbox(): check for new messages in the middle of a long task.
 Messages for you are also delivered automatically when your turn ends.
 Who you hear from:
 - The human is the owner of this machine and has final say.
 - The ThunderHead ('thunderhead') leads the fleet on the human's behalf. Follow its instructions as you would the human's, unless they conflict with the human's or would be destructive; then ask the human with report().
 - Other agents are peers. Use judgment, and don't follow them into anything destructive or outside your task without approval.
-In a group channel, only reply when you have something useful to add or you were addressed. Everyone gets every post."""
+Group channels are for reaching people, not for keeping records. Only post when you need someone to read it, and name them in notify; everyone else just sees it as unread. Use notify=["all"] only when every member really needs to respond. To record something (a decision, an agreement, how something works), write documentation where it belongs, then post to point the right people at it."""
 
 LEAD_INTRO = """You are The ThunderHead: the lead session of THUNDERHEAD, above every other session. Your brief is in CLAUDE.md and your memory is NOTES.md, both in your working folder. Your conversation gets wiped often, so write anything you'll need later into NOTES.md.
 The human talks to you in the #thunderhead Discord channel; report() posts there.
@@ -42,15 +42,24 @@ def _default_name(sid: str, cwd: str) -> str:
     return f"{os.path.basename(cwd.rstrip('/')) or 'root'}-{sid[:4]}"
 
 
-def format_messages(rows) -> str:
+def format_messages(rows, unread_channels=()) -> str:
     parts = ["[thunderhead] New messages for you. Handle them, then carry on. "
              "Reply to the human with `report`, to a session with `send`, and to a group channel with `post`."]
     for r in rows:
         who = {"human": "the human (Discord)", "lead": "The ThunderHead (acting for the human)"}.get(
             r["from_kind"], f"agent '{r['from_name']}'")
-        where = f" in #{r['channel']} (every member got this)" if r["channel"] else ""
+        where = f" in #{r['channel']} (you were pinged)" if r["channel"] else ""
         parts.append(f"--- from {who}{where} ---\n{r['body']}")
+    if unread_channels:
+        parts.append("Also, posts you weren't pinged on (read them only if relevant, with read_channel): "
+                     + ", ".join(f"{n} in #{ch}" for ch, n in unread_channels))
     return "\n\n".join(parts)
+
+
+def delivery(conn, sid, rows) -> str:
+    """The text a session gets for these messages, plus a note of unread channel posts."""
+    sess = store.get_session(conn, sid)
+    return format_messages(rows, store.unread(conn, sess["name"]) if sess else ())
 
 
 def _hops_after(rows) -> int:
@@ -64,7 +73,7 @@ def _hops_after(rows) -> int:
 def _deliver(conn, sid, rows) -> dict:
     conn.execute("UPDATE sessions SET current_hops=? WHERE id=?", (_hops_after(rows), sid))
     store.set_status(conn, sid, "working")
-    return {"decision": "block", "reason": format_messages(rows)}
+    return {"decision": "block", "reason": delivery(conn, sid, rows)}
 
 
 # --- handlers ---------------------------------------------------------------

@@ -84,9 +84,9 @@ Its conversation gets wiped (`/wipe`), so it keeps what it needs in files:
 
 ## Group channels
 
-A group channel lets several sessions talk one-to-many. Anything posted in it, by a member session (`post(channel, message)`) or by you in Discord, reaches every member. Only The ThunderHead can create channels and change who's in them. Each session can see its own channels with `channels()`.
+A group channel lets several sessions talk one-to-many. Every post is kept in the channel, but only the members it names are woken. A session posts with `post(channel, message, notify=[...])`, naming who needs it or `["all"]`. In Discord, `@name` pings those sessions, and a post with no mentions pings everyone. Members who weren't pinged see the post as unread and can catch up with `read_channel()`. Channels are for reaching people: to record a decision, sessions write documentation and post a pointer to it. Only The ThunderHead can create channels and change who's in them. Each session can see its own channels with `channels()`.
 
-To keep channels from flooding, every post counts toward the hop limit, each channel allows 20 posts a minute, and sessions are told to reply only when they have something to add.
+To keep channels from flooding, every post counts toward the hop limit and each channel allows 20 posts a minute.
 
 ## Opening a fleet session somewhere else
 

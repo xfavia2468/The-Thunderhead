@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import shlex
 import time
@@ -15,7 +16,7 @@ from discord.ext import tasks
 
 from . import db as store
 from .config import MEMORY_ROOT, MEMORY_SNAPSHOT_SECONDS, ROOT, SETTINGS_FILE
-from .hooks import _hops_after, format_messages
+from .hooks import _hops_after, delivery
 from .launch import NAME_RE, bg_command, lead_command
 
 log = logging.getLogger("thunderhead")
@@ -385,6 +386,7 @@ class Thunderhead(discord.Client):
                 rows = store.take_messages(conn, sid)
                 if not rows:
                     return
+                text_for = delivery(conn, sid, rows)
                 store.set_status(conn, sid, "waking")
             if not Path(sess["cwd"] or "").is_dir():
                 code, text = 1, f"its folder `{sess['cwd']}` no longer exists."
@@ -392,7 +394,7 @@ class Thunderhead(discord.Client):
                 # Fails harmlessly when the process has already exited.
                 await run_claude(["claude", "stop", short_id(sid)])
                 code, text = await run_claude(
-                    bg_command(sess["name"], resume=sid, role=sess["role"]) + [format_messages(rows)], cwd=sess["cwd"])
+                    bg_command(sess["name"], resume=sid, role=sess["role"]) + [text_for], cwd=sess["cwd"])
             with store.db() as conn:
                 if code == 0:
                     self.wake_failed.pop(sid, None)
@@ -431,7 +433,11 @@ class Thunderhead(discord.Client):
                 await message.add_reaction("⛔")
                 return
             if group is not None:
-                got = store.fan_out(conn, group["name"], "human", message.author.display_name, message.content)
+                # @name pings those sessions; no mentions pings everyone, since you're the one asking.
+                mentioned = [m for m in re.findall(r"@([A-Za-z0-9_-]+)", message.content)
+                             if m in store.members(conn, group["name"])]
+                got = store.fan_out(conn, group["name"], "human", message.author.display_name,
+                                    message.content, notify=mentioned or ["all"])
                 targets = [store.session_by_name(conn, n) for n in got]
             elif sess is None:
                 targets = None  # no ThunderHead yet

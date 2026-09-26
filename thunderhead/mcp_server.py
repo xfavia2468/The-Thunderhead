@@ -3,6 +3,7 @@
 The ThunderHead (the lead session) gets extra tools on top. They are only registered
 when this server runs inside it, and each one checks the caller's role again.
 """
+import json
 import os
 import re
 from pathlib import Path
@@ -12,7 +13,7 @@ from mcp.server.mcpserver import MCPServer
 from . import db as store
 from . import launch
 from .config import MAX_HOPS
-from .hooks import _hops_after, format_messages
+from .hooks import _hops_after, delivery
 
 mcp = MCPServer("thunderhead", instructions="Talk to the human (via Discord) and to other Claude sessions.")
 
@@ -106,8 +107,14 @@ def send(to: str, message: str) -> str:
 
 
 @mcp.tool()
-def post(channel: str, message: str) -> str:
-    """Post to a group channel. Every member session gets it, and the human sees it in Discord."""
+def post(channel: str, message: str, notify: list[str]) -> str:
+    """Post to a group channel to reach specific members. The human sees every post in Discord.
+
+    Only post when you need someone to read it. notify: the member session names who need it
+    (they're woken and get it now), or ["all"] when every member really must respond. Other members
+    aren't interrupted; they see it as unread. To record a decision or document how something works,
+    write documentation where it belongs instead, then post to point the right people at it.
+    """
     with store.db() as conn:
         me = _me(conn)
         ch = store.get_channel(conn, channel.lstrip("#"))
@@ -115,14 +122,35 @@ def post(channel: str, message: str) -> str:
             return f"No open channel #{channel}. channels() lists yours."
         if me["name"] not in store.members(conn, ch["name"]) and not _is_lead(me):
             return f"You aren't a member of #{ch['name']}. Ask The ThunderHead to add you."
+        roster = store.members(conn, ch["name"])
+        unknown = [n for n in notify if n != "all" and n not in roster]
+        if not notify or unknown:
+            return (f"notify must name members of #{ch['name']} ({', '.join(roster)}) or be [\"all\"]"
+                    + (f"; not members: {', '.join(unknown)}" if unknown else "") + ".")
         if store.recent_posts(conn, ch["name"]) >= CHANNEL_RATE:
             return f"#{ch['name']} is busy ({CHANNEL_RATE} posts in the last minute). Wait, then try again."
         hops = _next_hops(me)
         if hops is None:
             return HOPS_REFUSAL
-        got = store.fan_out(conn, ch["name"], _kind(me), me["name"], message, hops=hops)
-        store.post(conn, me["id"], "channel_post", message, channel=ch["name"])
-    return f"Posted to #{ch['name']}; delivered to {', '.join(got) or 'nobody else yet'}."
+        got = store.fan_out(conn, ch["name"], _kind(me), me["name"], message, notify, hops=hops)
+        pinged = "everyone" if "all" in notify else ", ".join(f"@{n}" for n in got) or "nobody"
+        store.post(conn, me["id"], "channel_post", f"→ {pinged}\n{message}", channel=ch["name"])
+    return f"Posted to #{ch['name']}; notified {', '.join(got) or 'nobody'}."
+
+
+@mcp.tool()
+def read_channel(channel: str, limit: int = 20) -> str:
+    """Show a group channel's recent posts (including ones you weren't pinged on) and mark them read."""
+    with store.db() as conn:
+        me = _me(conn)
+        name = channel.lstrip("#")
+        if me["name"] not in store.members(conn, name) and not _is_lead(me):
+            return f"You aren't a member of #{name}."
+        rows = store.read_log(conn, name, me["name"], limit=max(1, min(limit, 100)))
+    if not rows:
+        return f"#{name} has no posts yet."
+    return "\n\n".join(f"[{r['from_name']} → {', '.join(json.loads(r['notified'])) or 'nobody'}]\n{r['body']}"
+                        for r in rows)
 
 
 @mcp.tool()
@@ -133,9 +161,11 @@ def channels() -> str:
         names = ([c["name"] for c in store.open_channels(conn)] if _is_lead(me)
                  else store.channels_of(conn, me["name"]))
         rows = [(store.get_channel(conn, n), store.members(conn, n)) for n in names]
+        unread = dict(store.unread(conn, me["name"]))
     if not rows:
         return "You aren't in any group channels."
-    return "\n".join(f"- #{c['name']}: {c['topic'] or 'no topic'} (members: {', '.join(m)})" for c, m in rows)
+    return "\n".join(f"- #{c['name']}: {c['topic'] or 'no topic'} (members: {', '.join(m)})"
+                     + (f", {unread[c['name']]} unread" if c["name"] in unread else "") for c, m in rows)
 
 
 @mcp.tool()
@@ -157,7 +187,7 @@ def inbox() -> str:
         rows = store.take_messages(conn, me["id"])
         if rows:
             conn.execute("UPDATE sessions SET current_hops=? WHERE id=?", (_hops_after(rows), me["id"]))
-    return format_messages(rows) if rows else "No new messages."
+        return delivery(conn, me["id"], rows) if rows else "No new messages."
 
 
 # --- The ThunderHead only ---------------------------------------------------
