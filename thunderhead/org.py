@@ -200,8 +200,8 @@ def spawn_dev(conn, team: str, directory: str, task: str, name: str, model: str 
                 f"with request('model', {{'dev': '{name}', 'model': '{model}'}}, reason).", [], "")
     awake = store.awake_devs(conn, team)
     if by != "human" and len(awake) >= t["max_awake"]:
-        return (f"Team '{team}' already has {len(awake)} devs awake (its limit is {t['max_awake']}): "
-                f"{', '.join(awake)}. Wait for one to finish, or archive_dev() one that's done.", [], "")
+        return (f"Team '{team}' already has {len(awake)} devs busy (its limit is {t['max_awake']}): "
+                f"{', '.join(awake)}. Wait for one to finish its turn.", [], "")
     err = ceiling_error(conn)
     if err:
         return err, [], ""

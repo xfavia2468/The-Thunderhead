@@ -180,7 +180,15 @@ MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER DEFAULT 0",  # size of its context now
     "ALTER TABLE sessions ADD COLUMN transcript_offset INTEGER DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN last_counted TEXT",               # last message id counted
+    # Which version of the tools the session loaded (mcp_server.py's mtime), to spot stale ones.
+    "ALTER TABLE sessions ADD COLUMN tools_version INTEGER",
 ]
+
+
+def tools_version() -> int:
+    """The current version of the session tools: when mcp_server.py last changed."""
+    from pathlib import Path
+    return int(Path(__file__).with_name("mcp_server.py").stat().st_mtime)
 
 # The lead session: its name, and the role that unlocks its tools.
 LEAD = "thunderhead"
@@ -459,13 +467,17 @@ def set_model(conn, name, model: str | None = None, effort: str | None = None):
                  (name, model or cur_model or "sonnet", effort if effort is not None else cur_effort))
 
 
+BUSY = ("starting", "waking", "working", "needs_you")
+
+
 def awake_devs(conn, team) -> list[str]:
-    """A team's devs that are up right now (not asleep, not stopped or ended)."""
+    """A team's devs that are busy right now: in a turn, or starting one. A dev that's listening
+    between turns, or asleep, costs nothing and doesn't count against the team's max_awake."""
     t = get_team(conn, team)
     out = []
     for name in team_members_of(conn, team):
         s = session_by_name(conn, name)
-        if name != t["supervisor"] and s is not None and s["status"] not in DEAD and s["status"] != SLEEPING:
+        if name != t["supervisor"] and s is not None and s["status"] in BUSY:
             out.append(name)
     return out
 

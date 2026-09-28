@@ -264,9 +264,9 @@ def prepare_supervisor(team) -> Path:
             "Pick up work from your backlog on your own, within your charter."
             if team["autonomy"] == "act" else
             "Only work on what you're given. When a task is done, propose what to do next and wait for a yes.")
-        + f"\n- **Max awake: {team['max_awake']}.** How many of your devs may be awake at once. There's no limit "
-          "on how many you keep: a sleeping dev costs nothing. At the limit, a spawn is refused and calls to "
-          "sleeping devs wait for a free slot.\n"
+        + f"\n- **Max awake: {team['max_awake']}.** How many of your devs may be busy (in a turn) at once. There's "
+          "no limit on how many you keep: a dev that's asleep or idle costs nothing. At the limit, a spawn is "
+          "refused and calls to sleeping devs wait for a free slot.\n"
           f"- **Max model: {team['max_model']}.** The strongest model you may give a dev yourself. For a dev "
           "that needs more, ask The Thunderhead with request('model', ...).\n\n"
         f"## Charter ({status})\n\n{charter}\n"))

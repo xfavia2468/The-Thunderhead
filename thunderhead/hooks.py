@@ -138,6 +138,7 @@ def session_start(p):
                              listen=flag("THUNDERHEAD_LISTEN"),
                              remote_approval=flag("THUNDERHEAD_REMOTE_APPROVAL"), role=role)
         store.set_status(conn, sid, "idle")
+        conn.execute("UPDATE sessions SET tools_version=? WHERE id=?", (store.tools_version(), sid))
         path = p.get("transcript_path")
         if path and os.path.exists(path) and not (prev and prev["transcript_offset"]):
             conn.execute("UPDATE sessions SET transcript_offset=? WHERE id=?", (os.path.getsize(path), sid))

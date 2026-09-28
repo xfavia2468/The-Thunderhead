@@ -860,8 +860,25 @@ class Thunderhead(discord.Client):
                     self.deleting.discard(name)
         for s in to_reap:
             await run_claude(["claude", "stop", short_id(s["id"])])
+        await self.refresh_stale(active)
         for s in to_wake:
             asyncio.create_task(self.wake(s))
+
+    async def refresh_stale(self, active: dict):
+        """Sessions that loaded older tools get them on their next wake-up. So once an idle background
+        session is running old tools, put it to sleep: the next message wakes it with the new ones.
+        Busy sessions are left alone until they're idle."""
+        current = store.tools_version()
+        with store.db() as conn:
+            stale = [s for s in store.live_sessions(conn)
+                     if s["tools_version"] != current and s["status"] in ("listening", "idle")
+                     and (active.get(s["id"]) or {}).get("kind") == "background"
+                     and s["id"] not in self.waking]
+            for s in stale:
+                store.set_status(conn, s["id"], store.SLEEPING)  # quiet SessionEnd; any message wakes it
+        for s in stale:
+            await run_claude(["claude", "stop", short_id(s["id"])])
+            log.info("Put %s to sleep to pick up updated tools", s["name"])
 
     @tasks.loop(seconds=MEMORY_SNAPSHOT_SECONDS)
     async def snapshot_memory(self):

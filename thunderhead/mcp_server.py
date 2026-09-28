@@ -144,7 +144,7 @@ def send(to: str, message: str, wake: bool | None = None) -> str:
         with store.db() as conn:
             t = store.get_team(conn, team) if role == "dev" else None
             if t is not None and len(store.awake_devs(conn, team)) >= t["max_awake"]:
-                return (f"Called {to}, but team {team} already has {t['max_awake']} devs awake, so it waits for a "
+                return (f"Called {to}, but team {team} already has {t['max_awake']} devs busy, so it waits for a "
                         "slot and wakes when one frees up.")
         return f"Called {to}. It isn't running, so it's being woken to receive it (about 20 seconds)."
     return f"Called {to}. It gets this when its current turn ends."
