@@ -174,3 +174,7 @@ Anyone who can command the bot can run code on this machine. The bot only accept
 - Slash commands not showing: check the invite included `applications.commands` and that `DISCORD_GUILD_ID` is correct, then restart the bot.
 - Bot ignores your messages: turn on Message Content Intent (step 1.2).
 - Hook problems are logged to `data/hook-errors.log`. Hooks never break a session; on error they do nothing.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
