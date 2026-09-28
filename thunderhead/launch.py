@@ -5,8 +5,8 @@ import subprocess
 from pathlib import Path
 
 from . import db as store
-from .config import (BRIEFS, DEFAULT_DEV_MODEL, LEAD_MODEL, MCP_FILE, MEMORY_ROOT, SETTINGS_FILE,
-                     SUPERVISOR_MODEL, WORKSPACES)
+from .config import (BRIEFS, DEFAULT_DEV_MODEL, LEAD_MODEL, MCP_FILE, MEMORY_ROOT, PERMISSION_MODE,
+                     SETTINGS_FILE, SUPERVISOR_MODEL, WORKSPACES)
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 HQ = MEMORY_ROOT / "hq"
@@ -161,10 +161,14 @@ def bg_command(name: str, resume: str | None = None, role: str = "worker",
         # The product repos' own CLAUDE.md is the best description of the product; Claude Code
         # only loads it from --add-dir folders with this set.
         settings["env"]["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
+        # Supervisors integrate their devs' work: reviewing branches, merging, opening PRs.
+        settings["permissions"]["allow"] += ["Bash(git *)", "Bash(gh *)"]
     cmd = ["claude", "--bg"] + (["--resume", resume] if resume else [])
     cmd += ["-n", name, "--settings", json.dumps(settings), f"--mcp-config={MCP_FILE}"]
     # Lead sessions get their configured model; everyone else what they were given.
     cmd += ["--model", {"lead": LEAD_MODEL, "supervisor": SUPERVISOR_MODEL}.get(role) or model or DEFAULT_DEV_MODEL]
+    if PERMISSION_MODE and PERMISSION_MODE != "default":
+        cmd += ["--permission-mode", PERMISSION_MODE]
     if effort:
         cmd += ["--effort", effort]
     if dev:

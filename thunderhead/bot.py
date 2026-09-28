@@ -1197,8 +1197,13 @@ async def do_spawn(interaction: discord.Interaction, directory: str, task: str, 
         cmd, prompt = bg_command(name, model=model), task
         with store.db() as conn:
             store.set_model(conn, name, model or config.DEFAULT_DEV_MODEL)
-    if mode and mode != "default":
-        cmd += ["--permission-mode", mode]
+    if mode:
+        # Replace the fleet's default permission mode with the one you picked.
+        if "--permission-mode" in cmd:
+            i = cmd.index("--permission-mode")
+            del cmd[i:i + 2]
+        if mode != "default":
+            cmd += ["--permission-mode", mode]
     code, text = await run_claude(cmd + [prompt], cwd=cwd)
     if code != 0:
         if team:

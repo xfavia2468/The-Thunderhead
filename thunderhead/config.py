@@ -57,6 +57,9 @@ LEAD_MODEL = os.environ.get("THUNDERHEAD_LEAD_MODEL", "sonnet")
 SUPERVISOR_MODEL = os.environ.get("THUNDERHEAD_SUPERVISOR_MODEL", "opus")
 DEFAULT_DEV_MODEL = os.environ.get("THUNDERHEAD_DEV_MODEL", "sonnet")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# Permission mode for sessions the fleet launches. In auto mode Claude Code approves routine
+# actions itself and asks only about risky ones, which reach the human as Discord buttons.
+PERMISSION_MODE = os.environ.get("THUNDERHEAD_PERMISSION_MODE", "auto")
 # One-off sessions The Thunderhead may have running at once (the human's own don't count).
 MAX_ONEOFFS = int(os.environ.get("THUNDERHEAD_MAX_ONEOFFS", 2))
 

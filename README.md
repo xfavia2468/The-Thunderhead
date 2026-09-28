@@ -27,6 +27,8 @@ Only sessions started with `bin/th-claude` or `/spawn` are connected. Your globa
 
 The bot uses channels named `#fleet`, `#needs-you`, `#agent-chatter`, `#thunderhead` and `#archived`, and creates any that are missing. Group channels go in a **groups** category.
 
+Sessions the fleet launches run in Claude Code's **auto** permission mode (`THUNDERHEAD_PERMISSION_MODE`): routine actions are approved automatically, and risky ones reach you as buttons in `#needs-you`.
+
 Messages are embeds whose side-bar color says who's talking or what it is: gold for The Thunderhead, purple for supervisors and teams, blue for devs, amber for "needs you", orange for decisions, green or red for their outcome, teal for sessions talking to each other, grey for lifecycle notices. Leaving out the text of `/spawn` or `/send` opens a form with room for multi-line text. Rejecting a request or a charter opens a form for feedback.
 
 - `#fleet` is the board: one line per session, grouped by The Thunderhead, each team, and sessions without a team. Nothing is hidden. If it outgrows one message, it continues in more. New-session notices have an Acknowledge button that clears them; their threads stay, linked from the board.
@@ -96,7 +98,7 @@ you ──▶ The Thunderhead ──▶ team supervisors ──▶ dev sessions
 ```
 
 - **The Thunderhead** (`#thunderhead`) is the lead. It knows which team owns what and routes your requests there. It never does hands-on work, and it never goes around a supervisor to reach its devs. It creates teams, decides supervisors' requests, and can stop any session in an emergency. For small, self-contained jobs that no team owns, it can start a **one-off** (`spawn_oneoff`). The one-off reports back and is deleted once done. At most 2 run at once (`THUNDERHEAD_MAX_ONEOFFS`), and each is announced in `#thunderhead`.
-- **A team** exists for each project or product domain. Its **supervisor** is the product owner: it knows the product in depth, reads the code without writing it, picks the right dev for each task and reviews the result.
+- **A team** exists for each project or product domain. Its **supervisor** is the product owner: it knows the product in depth, reads the code without writing it, picks the right dev for each task, reviews the result and lands it (merges the branch or opens and merges a PR with `git` and `gh`).
 - **Devs** do the work. They take tasks from their supervisor and can talk to any other dev directly. When they agree on something, they document it in the product repo and point their supervisor at it.
 
 You can talk to any level directly: `#thunderhead`, a team's `#<team>-supervisor` desk, or a dev's thread. If you skip a level, that level gets an FYI copy, so its picture stays current. An FYI arrives with a session's next real message and never wakes it on its own.
