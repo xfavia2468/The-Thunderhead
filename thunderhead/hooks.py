@@ -19,6 +19,7 @@ Use the `thunderhead` MCP tools:
 - send(to, message, wake): message another session by name. Messages up the chain (to your supervisor, or to The Thunderhead) are calls by default: they wake the recipient to act. Everything else is a note by default: read the next time the recipient wakes, without waking it. Pass wake=True to call anyone into action now (a task, a question you need answered), or wake=False to leave a note. sessions() lists them.
 - post(channel, message, notify): post to a group channel you're in, pinging the members in notify. channels() lists yours; read_channel() shows recent posts.
 - inbox(): check for new messages in the middle of a long task.
+- history(target, hours): what happened, from the fleet's records: reports, messages, posts, starts and stops.
 Messages for you are also delivered automatically when your turn ends.
 Who you hear from:
 - The human is the owner of this machine and has final say.

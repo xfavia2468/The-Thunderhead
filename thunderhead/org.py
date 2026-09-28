@@ -493,3 +493,38 @@ def propose_charter(conn, me, text: str, summary: str) -> str:
     store.post(conn, me["id"], "request_escalated", str(cur.lastrowid))
     fyi(conn, store.LEAD, f"{me['name']} proposed a charter for team {team['name']} to the human: {summary}")
     return f"Charter sent to the human for approval (request #{cur.lastrowid}). Keep working from the draft meanwhile."
+
+
+# --- history ----------------------------------------------------------------
+
+HISTORY_KINDS = {"report": "report", "status": "status", "agent_msg": "sent", "channel_post": "posted",
+                 "session_start": "started", "session_end": "ended", "stopped": "stopped", "woken": "woken",
+                 "needs_you": "needed the human", "compacted": "compacted", "usage_limit": "hit a usage limit"}
+
+
+def history(conn, names: list[str], hours: float, limit: int) -> list[str]:
+    """What these sessions did and were told, newest last: from the outbox (what they reported,
+    sent and posted) and the human's messages to them."""
+    since = store.now() - hours * 3600
+    ids = {r["id"]: r["name"] for r in conn.execute(
+        f"SELECT id, name FROM sessions WHERE name IN ({','.join('?' * len(names))})", names)} if names else {}
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    rows = []
+    for r in conn.execute(f"SELECT session_id, kind, body, channel, created_at FROM outbox WHERE session_id IN ({marks}) "
+                          f"AND created_at >= ? AND kind IN ({','.join('?' * len(HISTORY_KINDS))})",
+                          [*ids, since, *HISTORY_KINDS]):
+        where = f" in #{r['channel']}" if r["channel"] else ""
+        rows.append((r["created_at"], f"{ids[r['session_id']]} {HISTORY_KINDS[r['kind']]}{where}: {r['body']}"))
+    for r in conn.execute(f"SELECT to_session, body, created_at FROM messages WHERE to_session IN ({marks}) "
+                          f"AND from_kind='human' AND created_at >= ?", [*ids, since]):
+        rows.append((r["created_at"], f"the human told {ids[r['to_session']]}: {r['body']}"))
+    rows.sort()
+    import datetime
+    out = []
+    for ts, text in rows[-limit:]:
+        when = datetime.datetime.fromtimestamp(ts).strftime("%a %H:%M")
+        text = " ".join(text.split())
+        out.append(f"[{when}] {text[:300]}{'…' if len(text) > 300 else ''}")
+    return out

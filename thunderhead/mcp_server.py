@@ -249,6 +249,35 @@ def team() -> str:
 
 
 @tool
+def history(target: str = "", hours: float = 24, limit: int = 60) -> str:
+    """What happened: reports, status updates, messages sent, channel posts, starts and stops, and the
+    human's messages, newest last. Use it to catch up after a wipe or restart, or to answer "what did
+    X do this week?" from the record rather than memory.
+
+    target: a session name or a team name. The Thunderhead may look at anything (empty means the whole
+    fleet); a supervisor at its own team and devs; a dev at itself. hours: how far back. limit: at most
+    this many entries.
+    """
+    with store.db() as conn:
+        me = _me(conn)
+        role, my_team = store.rank(conn, me["name"])
+        if store.get_team(conn, target):
+            names = store.team_members_of(conn, target)
+        elif target:
+            names = [target]
+        else:
+            names = ([r[0] for r in conn.execute("SELECT DISTINCT name FROM sessions")] if role == "lead"
+                     else store.team_members_of(conn, my_team) if role == "supervisor" else [me["name"]])
+        if role != "lead":
+            allowed = set(store.team_members_of(conn, my_team)) if role == "supervisor" else {me["name"]}
+            if not set(names) <= allowed:
+                return ("You can see your own team's history." if role == "supervisor"
+                        else "You can see your own history.")
+        lines = org.history(conn, names, max(0.1, hours), max(1, min(limit, 300)))
+    return "\n".join(lines) or f"Nothing recorded in the last {hours:g} hours."
+
+
+@tool
 def inbox() -> str:
     """Check for new messages without waiting for your turn to end."""
     with store.db() as conn:
