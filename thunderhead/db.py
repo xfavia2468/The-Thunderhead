@@ -300,6 +300,13 @@ def session_by_thread(conn, thread_id):
     return conn.execute(f"SELECT * FROM sessions WHERE thread_id=? {_CURRENT}", (thread_id,)).fetchone()
 
 
+def is_archived(conn, row) -> bool:
+    """Filed away by the human (/archive or archive_dev): its thread is archived and listed in
+    #archived. Still wakeable, but done for now, and not part of the working fleet."""
+    return bool(row["thread_id"]) and conn.execute(
+        "SELECT 1 FROM archived_posts WHERE thread_id=?", (row["thread_id"],)).fetchone() is not None
+
+
 def live_sessions(conn):
     return conn.execute(
         f"SELECT * FROM sessions WHERE status NOT IN {DEAD} ORDER BY created_at").fetchall()

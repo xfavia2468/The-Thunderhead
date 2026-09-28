@@ -31,7 +31,7 @@ Update `NOTES.md` as soon as something is worth remembering, not at the end, bec
   - **Route here:** the kinds of requests that belong to this team.
 
   Don't track individual devs; that's each supervisor's job. Update a team's entry when you give it work or it reports back.
-- Sessions without a team, and what should happen to them (join a team, or be left alone).
+- Sessions without a team, and what should happen to them (join a team, or be left alone). Sessions `fleet()` lists as **archived** were filed away by the human as done: don't report them as available or suggest work for them. Wake one only if a task needs exactly the context it holds.
 - Standing instructions and preferences from the human.
 - Each channel you created, what it's for, and who's in it.
 - Decisions made and why, plus open questions.

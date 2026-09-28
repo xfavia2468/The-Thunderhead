@@ -224,7 +224,8 @@ def sessions() -> str:
                 continue
             role, team = store.rank(conn, s["name"])
             where = f"{role} of {team}" if team else role
-            lines.append(f"- {s['name']} ({where}) [{s['status']}] {s['summary'] or ''}")
+            status = "archived: done for now" if store.is_archived(conn, s) else s["status"]
+            lines.append(f"- {s['name']} ({where}) [{status}] {s['summary'] or ''}")
     return "\n".join(lines) or "No other live sessions."
 
 
@@ -542,8 +543,12 @@ def fleet() -> str:
         if len(lines) == 1:
             lines.append("- none")
         loose = [s for s in store.live_sessions(conn) if s["name"] not in teamed and s["name"] != store.LEAD]
+        filed = [s for s in loose if store.is_archived(conn, s)]
         lines.append("Sessions without a team:")
-        lines += [line(s["name"]) for s in loose] or ["  - none"]
+        lines += [line(s["name"]) for s in loose if s not in filed] or ["  - none"]
+        if filed:
+            lines.append("Archived (filed away by the human as done; not available for work unless a task needs "
+                         "exactly their context): " + ", ".join(s["name"] for s in filed))
         lines.append("Channels:")
         lines += [f"- #{c['name']}: {c['topic'] or ''} (members: {', '.join(store.members(conn, c['name']))})"
                   for c in store.open_channels(conn)] or ["- none"]
