@@ -39,6 +39,40 @@ ATTACHMENTS = ROOT / "data" / "attachments"
 ATTACHMENT_LIMIT = 25_000_000
 
 
+USAGE_LINE = re.compile(r"Current (?P<label>[^:]+): (?P<pct>\d+)% used(?: · resets (?P<reset>.+))?")
+
+
+def parse_usage(text: str) -> list[dict]:
+    """The limits `claude /usage` reports: [{label, pct, reset (unix time or None)}]."""
+    out = []
+    for m in USAGE_LINE.finditer(text):
+        out.append({"label": m["label"].strip(), "pct": int(m["pct"]), "reset": parse_reset(m["reset"] or "")})
+    return out
+
+
+def parse_reset(text: str) -> int | None:
+    """'Sep 28, 2:59pm (America/Chicago)' -> unix time. The year is implied: the next such date."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    m = re.match(r"(?P<when>.+?)\s*\((?P<tz>[^)]+)\)", text.strip())
+    if not m:
+        return None
+    try:
+        tz = ZoneInfo(m["tz"])
+        now = datetime.now(tz)
+        when = datetime.strptime(f"{m['when'].strip()} {now.year}", "%b %d, %I:%M%p %Y").replace(tzinfo=tz)
+        if when < now.replace(month=1, day=1) or (now - when).days > 180:
+            when = when.replace(year=now.year + 1)
+        return int(when.timestamp())
+    except (ValueError, KeyError):
+        return None
+
+
+def usage_bar(pct: int, width: int = 12) -> str:
+    filled = round(width * min(max(pct, 0), 100) / 100)
+    return "█" * filled + "░" * (width - filled)
+
+
 def short_count(n: int) -> str:
     n = n or 0
     return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1e3 else str(n)
@@ -301,6 +335,7 @@ class Thunderhead(discord.Client):
         self.hook_log_size: int | None = None
         self.hook_errors_at = 0.0
         self.last_tasks: dict[str, str] = {}  # team -> task board text last posted
+        self.usage: list[dict] = []  # the plan's limits, from `claude /usage`
 
     async def setup_hook(self):
         self.add_dynamic_items(ApprovalButton, RequestButton, ReplyButton, AckButton)
@@ -325,7 +360,7 @@ class Thunderhead(discord.Client):
         self.guild = guild
         log.info("Logged in as %s; watching %s", self.user, guild.name)
         await self.tidy_fleet()
-        for loop in (self.pump, self.board, self.liveness, self.snapshot_memory):
+        for loop in (self.pump, self.board, self.liveness, self.snapshot_memory, self.check_usage):
             if not loop.is_running():
                 loop.start()
 
@@ -763,7 +798,7 @@ class Thunderhead(discord.Client):
             lines = []
             for key in order:
                 lines += ([""] if lines else []) + [f"**{key}**"] + [line for _, line in sorted(groups[key])]
-            pages = board_pages([self.health_line(), ""] + lines)
+            pages = board_pages([self.health_line(), *self.usage_lines(), ""] + lines)
             if pages == self.last_board:
                 return
             ids = json.loads(store.kv_get(conn, "board_message_ids") or "[]")
@@ -975,6 +1010,29 @@ class Thunderhead(discord.Client):
         elif "hooks" in self.issues and now - self.hook_errors_at > 1800:
             self.fine("hooks")  # quiet for half an hour
         self.hook_log_size = size
+
+    def usage_lines(self) -> list[str]:
+        """Your plan's limits as bars: the 5-hour session window and the weekly limits."""
+        if not self.usage:
+            return []
+        lines = []
+        for u in self.usage:
+            label = "Session" if u["label"].lower().startswith("session") else u["label"].replace("week", "Week")
+            icon = "⏱️" if label == "Session" else "📅"
+            warn = " ⚠️" if u["pct"] >= 80 else ""
+            reset = f" · resets <t:{u['reset']}:R>" if u["reset"] else ""
+            lines.append(f"{icon} {label} `{usage_bar(u['pct'])}` **{u['pct']}%**{warn}{reset}")
+        return lines
+
+    @tasks.loop(minutes=5)
+    async def check_usage(self):
+        """How much of the plan's limits is used, from `claude /usage` (local; it doesn't spend any)."""
+        code, text = await run_claude(["claude", "-p", "/usage", "--no-session-persistence"], timeout=60, tail=None)
+        parsed = parse_usage(text) if code == 0 else []
+        if parsed:
+            self.usage = parsed
+        elif code != 0:
+            log.warning("Couldn't read usage: %s", text[-200:])
 
     def health_line(self) -> str:
         if not self.issues:
