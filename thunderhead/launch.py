@@ -13,6 +13,16 @@ HQ = MEMORY_ROOT / "hq"
 NOTES = HQ / "NOTES.md"
 PERSONALITY = HQ / "PERSONALITY.md"
 TEAMS = MEMORY_ROOT / "teams"
+# The fleet library: documents that outlive any team (rules, conventions, reusable instructions).
+# Every session can read it; The Thunderhead and supervisors curate it.
+LIBRARY = MEMORY_ROOT / "library"
+LIBRARY_INDEX = """# Fleet library
+
+Documents that outlive any one team: rules, conventions, reusable instructions. Every fleet session
+can read them. The Thunderhead and supervisors add and update them; keep this index current, one line
+per document, so sessions can find what they need without reading everything.
+
+"""
 
 GENERATED = ("<!-- Generated from {src} each time this session starts. "
              "Edit that file in the THUNDERHEAD repo, not this copy. -->\n\n")
@@ -175,7 +185,15 @@ def bg_command(name: str, resume: str | None = None, role: str = "worker",
         # How to be a dev in the fleet. A system-prompt addition rather than a CLAUDE.md, so the
         # product repo stays untouched and it survives compaction.
         cmd.append(f"--append-system-prompt-file={BRIEFS / 'dev.md'}")
-    return cmd + [f"--add-dir={d}" for d in add_dirs]
+    ensure_library()
+    lib = f"//{LIBRARY.as_posix().lstrip('/')}/**"
+    if role in ("lead", "supervisor"):
+        settings["permissions"]["allow"].append(f"Edit({lib})")
+    else:
+        settings["permissions"].setdefault("deny", []).append(f"Edit({lib})")
+    # Re-serialise: the permission rules above changed after the settings were first written.
+    cmd[cmd.index("--settings") + 1] = json.dumps(settings)
+    return cmd + [f"--add-dir={d}" for d in (*add_dirs, LIBRARY)]
 
 
 def relaunch_command(conn, sess, resume: str | None = None) -> list[str]:
@@ -202,6 +220,17 @@ def ensure_memory() -> None:
         (MEMORY_ROOT / "README.md").write_text(
             "# THUNDERHEAD memory\n\nNotes and team charters written by the fleet's lead sessions. "
             "The THUNDERHEAD bot commits snapshots here; roll back with git if notes get garbled.\n")
+
+
+def ensure_library() -> None:
+    """Create the library on first use, and make sure it holds no CLAUDE.md: Claude Code would load
+    one into sessions automatically, which is not what a reference document is for."""
+    LIBRARY.mkdir(parents=True, exist_ok=True)
+    index = LIBRARY / "INDEX.md"
+    if not index.exists():
+        index.write_text(LIBRARY_INDEX)
+    for stray in LIBRARY.rglob("CLAUDE.md"):
+        stray.rename(stray.with_name("CLAUDE.md.disabled"))
 
 
 def install_brief(folder, brief: str, extra: str = "") -> None:

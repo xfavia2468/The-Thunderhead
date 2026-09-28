@@ -131,6 +131,8 @@ Supervisors hold the durable project knowledge, in `~/thunderhead-memory/teams/<
 - `CHARTER.md`: the team's mandate, written when The Thunderhead creates the team.
 - `NOTES.md`: the supervisor's own notebook: the product, a roster of its devs (doing, knows, give it), backlog and decisions.
 
+The **fleet library**, `~/thunderhead-memory/library/`, holds documents that outlive any team: game rules, your conventions, reusable instructions. `INDEX.md` lists them. Every fleet session can read it. The Thunderhead and supervisors add and edit documents, and devs can only read them. The launcher disables any `CLAUDE.md` put there, since Claude Code would load one into every session.
+
 `~/thunderhead-memory/` is a separate, local-only git repo for the fleet's memory (set `THUNDERHEAD_MEMORY` to move it). The bot commits a snapshot every 10 minutes when something changed, so you can see how notes evolved and roll back if a lead session garbles them. Claude Code has to trust that folder before it will start sessions there: run `claude` in it once and accept the prompt.
 
 ## Group channels
