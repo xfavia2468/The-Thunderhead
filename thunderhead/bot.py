@@ -32,9 +32,25 @@ ICONS = look.ICONS
 # A quiet thread (say, a sleeping session's) drops out of the sidebar after a day. It's archived, not
 # deleted: board links still open it, and it comes back as soon as the session posts again.
 THREAD_ARCHIVE_MINUTES = 1440
+# After a usage limit, wake-ups pause; this often, one is let through to see if it has reset.
+USAGE_PROBE_SECONDS = 15 * 60
 # Files the human attaches in Discord are saved here, so sessions can read them.
 ATTACHMENTS = ROOT / "data" / "attachments"
 ATTACHMENT_LIMIT = 25_000_000
+
+
+def short_count(n: int) -> str:
+    n = n or 0
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1e3 else str(n)
+
+
+def name_tokens(conn, name) -> int:
+    """Tokens a session has used, across all its incarnations (resumes get new ids)."""
+    return conn.execute("SELECT COALESCE(SUM(tokens), 0) FROM sessions WHERE name=?", (name,)).fetchone()[0]
+
+
+def team_tokens(conn, team) -> int:
+    return sum(name_tokens(conn, n) for n in store.team_members_of(conn, team))
 
 
 def board_pages(lines: list[str]) -> list[str]:
@@ -599,6 +615,29 @@ class Thunderhead(discord.Client):
             await self.post_request(conn, org.get_request(conn, int(body)))
             return
         name = sess["name"]
+        if kind == "usage_limit":
+            msg = await self.channels[NEEDS_YOU].send(content=f"<@{OWNER_ID}>", embed=look.card(
+                f"**{name}** hit a usage limit:\n```\n{body[:900]}\n```\nWake-ups are paused across the fleet. "
+                "Your messages are queued. Every 15 minutes one wake-up is let through to see whether the limit "
+                "has reset, and everything resumes as soon as a turn succeeds.",
+                title="⏸️ Usage limit reached", color=look.BAD))
+            store.kv_set(conn, "usage_notice_id", msg.id)
+            return
+        if kind == "usage_resumed":
+            notice = store.kv_get(conn, "usage_notice_id")
+            if notice:
+                try:
+                    await (await self.channels[NEEDS_YOU].fetch_message(int(notice))).delete()
+                except discord.HTTPException:
+                    pass
+                conn.execute("DELETE FROM kv WHERE key='usage_notice_id'")
+            await self.channels[NEEDS_YOU].send(embed=look.note(
+                "▶️ **Usage is available again.** Wake-ups have resumed, and queued messages are being delivered.",
+                look.GOOD), view=ack_view())
+            return
+        if kind == "compacted":
+            await thread.send(embed=look.note(f"🗜️ **Context compacted** ({body}). Some of its detail may be gone."))
+            return
         if kind == "archive":
             if sess["status"] in ("working", "needs_you", "waking"):
                 org.fyi(conn, body, f"Couldn't archive {name}: it became busy ({sess['status']}) before I got to it.")
@@ -699,7 +738,8 @@ class Thunderhead(discord.Client):
                     continue  # older rows of a resumed session
                 seen.add(s["name"])
                 role, team = store.rank(conn, s["name"])
-                key = "👑 The Thunderhead" if role == "lead" else f"🧭 Team {team}" if team else "🛠️ Without a team"
+                key = ("👑 The Thunderhead" if role == "lead" else
+                       f"🧭 Team {team} · {short_count(team_tokens(conn, team))} used" if team else "🛠️ Without a team")
                 groups.setdefault(key, []).append((role != "supervisor", self.session_line(conn, s)))
             order = sorted(groups, key=lambda k: (not k.startswith("👑"), k.startswith("🛠️"), k))
             lines = []
@@ -745,6 +785,9 @@ class Thunderhead(discord.Client):
         role, _ = store.rank(conn, s["name"])
         tag = " · supervisor" if role == "supervisor" else ""
         where = f" · <#{s['thread_id']}>" if s["thread_id"] else ""
+        used = name_tokens(conn, s["name"])
+        if used or s["context_tokens"]:
+            where += f" · ctx {short_count(s['context_tokens'])} · {short_count(used)} used"
         summary = f"\n╰ {s['summary']}" if s["summary"] else ""
         return f"{ICONS.get(s['status'], '❔')} **{s['name']}**{tag} `{s['status']}`{where}{summary}"
 
@@ -833,6 +876,14 @@ class Thunderhead(discord.Client):
             if code != 0:
                 log.warning("Memory snapshot failed: %s", text)
 
+    def usage_paused(self, conn) -> dict | None:
+        """The current usage-limit pause, unless it's time to let a wake-up through to probe it."""
+        raw = store.kv_get(conn, "usage_limit")
+        if raw is None:
+            return None
+        info = json.loads(raw)
+        return info if time.time() - info["since"] < USAGE_PROBE_SECONDS else None
+
     async def wake(self, sess):
         """Resume a session in the background with its queued messages as the prompt.
 
@@ -841,6 +892,9 @@ class Thunderhead(discord.Client):
         sid = sess["id"]
         if sid in self.waking or time.time() - self.wake_failed.get(sid, 0) < 300:
             return
+        with store.db() as conn:
+            if self.usage_paused(conn):
+                return  # queued; delivered once the usage limit resets
         self.waking.add(sid)
         try:
             # Never restart a session that's open in someone's terminal; it gets the
@@ -980,6 +1034,11 @@ class Thunderhead(discord.Client):
             await message.add_reaction("⚡")
             return
         await message.add_reaction("📨")
+        with store.db() as conn:
+            paused = self.usage_paused(conn)
+        if paused:
+            await message.reply(embed=look.note("⏸️ Queued. The fleet is paused on a usage limit; this is "
+                                                "delivered once it resets.", look.BAD), mention_author=False)
         for t in targets:
             await self.deliver_now(t, message if group is None else None)
 

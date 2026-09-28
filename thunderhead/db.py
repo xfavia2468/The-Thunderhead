@@ -175,6 +175,11 @@ MIGRATIONS = [
     # nothing. max_model is the strongest model the supervisor may pick without asking.
     "ALTER TABLE teams ADD COLUMN max_awake INTEGER DEFAULT 3",
     "ALTER TABLE teams ADD COLUMN max_model TEXT DEFAULT 'sonnet'",
+    # Token use, counted from the session's transcript at the end of each turn.
+    "ALTER TABLE sessions ADD COLUMN tokens INTEGER DEFAULT 0",       # everything processed
+    "ALTER TABLE sessions ADD COLUMN context_tokens INTEGER DEFAULT 0",  # size of its context now
+    "ALTER TABLE sessions ADD COLUMN transcript_offset INTEGER DEFAULT 0",
+    "ALTER TABLE sessions ADD COLUMN last_counted TEXT",               # last message id counted
 ]
 
 # The lead session: its name, and the role that unlocks its tools.

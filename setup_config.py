@@ -17,6 +17,8 @@ TIMEOUTS = {
     "Notification": 30,
     "PermissionRequest": APPROVAL_SECONDS + 120,
     "SessionEnd": 30,
+    "StopFailure": 30,
+    "PostCompact": 30,
 }
 
 hook = f"{shlex.quote(str(PYTHON))} {shlex.quote(str(ROOT / 'hook.py'))}"

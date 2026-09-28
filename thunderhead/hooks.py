@@ -138,6 +138,9 @@ def session_start(p):
                              listen=flag("THUNDERHEAD_LISTEN"),
                              remote_approval=flag("THUNDERHEAD_REMOTE_APPROVAL"), role=role)
         store.set_status(conn, sid, "idle")
+        path = p.get("transcript_path")
+        if path and os.path.exists(path) and not (prev and prev["transcript_offset"]):
+            conn.execute("UPDATE sessions SET transcript_offset=? WHERE id=?", (os.path.getsize(path), sid))
         if p.get("source") in ("startup", "resume", None) and not waking:
             store.post(conn, sid, "session_start", f"`{cwd}` ({p.get('source', 'startup')})")
         context = INTRO.format(name=name) + "\n\n" + _org_intro(conn, name, role)
@@ -165,6 +168,39 @@ def user_prompt_submit(p):
         store.set_status(conn, p["session_id"], "working")
 
 
+def count_tokens(conn, sid, transcript_path):
+    """Add up the tokens in the session's transcript since the last count.
+
+    Each assistant entry carries its API usage. One reply can span several entries with the same
+    message id, so each id counts once. The last reply's input side is the context's current size.
+    """
+    sess = store.get_session(conn, sid)
+    if sess is None or not transcript_path or not os.path.exists(transcript_path):
+        return
+    offset, last_id = sess["transcript_offset"] or 0, sess["last_counted"]
+    total, context = 0, None
+    with open(transcript_path, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+    end = data.rfind(b"\n") + 1  # only whole lines; a partial last line is counted next time
+    for line in data[:end].splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        msg = entry.get("message") if isinstance(entry.get("message"), dict) else None
+        usage = msg and msg.get("usage")
+        if entry.get("type") != "assistant" or not usage or msg.get("id") == last_id:
+            continue
+        last_id = msg.get("id")
+        inputs = (usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+                  + usage.get("cache_read_input_tokens", 0))
+        total += inputs + usage.get("output_tokens", 0)
+        context = inputs
+    conn.execute("UPDATE sessions SET tokens=tokens+?, context_tokens=COALESCE(?, context_tokens), "
+                 "transcript_offset=?, last_counted=? WHERE id=?", (total, context, offset + end, last_id, sid))
+
+
 def _take_if_urgent(conn, sid):
     """Everything queued, but only once something urgent is there: FYIs never wake a session."""
     return store.take_messages(conn, sid) if store.has_urgent(conn, sid) else []
@@ -173,6 +209,11 @@ def _take_if_urgent(conn, sid):
 def stop(p):
     sid = p["session_id"]
     with store.db() as conn:
+        count_tokens(conn, sid, p.get("transcript_path"))
+        if store.kv_get(conn, "usage_limit") is not None:
+            # A turn finished normally, so the usage limit has reset.
+            conn.execute("DELETE FROM kv WHERE key='usage_limit'")
+            store.post(conn, sid, "usage_resumed", "")
         rows = _take_if_urgent(conn, sid)
         if rows:
             return _deliver(conn, sid, rows)
@@ -243,6 +284,50 @@ def permission_request(p):
     return None
 
 
+LIMIT_WORDS = ("rate", "limit", "usage", "quota", "billing", "overloaded")
+
+
+def stop_failure(p):
+    """A turn failed. A usage limit pauses the whole fleet's wake-ups until it resets; anything
+    else is flagged to the human."""
+    sid = p["session_id"]
+    error = str(p.get("error") or "unknown")
+    details = str(p.get("error_details") or "")
+    with store.db() as conn:
+        if any(w in (error + " " + details).lower() for w in LIMIT_WORDS):
+            first = store.kv_get(conn, "usage_limit") is None
+            store.kv_set(conn, "usage_limit", json.dumps({"since": time.time(), "session": sid,
+                                                          "error": error, "details": details[:500]}))
+            store.set_status(conn, sid, "idle")
+            if first:
+                store.post(conn, sid, "usage_limit", f"{error}: {details}"[:1000])
+        else:
+            store.set_status(conn, sid, "needs_you")
+            store.post(conn, sid, "needs_you", f"Its turn failed ({error}). {details}"[:1500])
+
+
+def post_compact(p):
+    """The session's context was just compacted: detail it had may be gone. Tell whoever relies on it."""
+    sid = p["session_id"]
+    with store.db() as conn:
+        sess = store.get_session(conn, sid)
+        if sess is None:
+            return None
+        role, team = store.rank(conn, sess["name"])
+        summary = (p.get("compact_summary") or "")[:600]
+        text = (f"'{sess['name']}' was just compacted ({p.get('trigger', 'auto')}): its context was summarized, and "
+                "detail it held may be gone. Update your notes on what it knows, and re-prime it or use a fresh "
+                "session if the specifics matter." + (f"\nIts summary begins: {summary}" if summary else ""))
+        if role == "dev":
+            store.queue_message(conn, store.session_by_name(conn, store.get_team(conn, team)["supervisor"])["id"],
+                                "fyi", "thunderhead-system", text, urgent=False)
+        elif role in ("supervisor", "unteamed"):
+            lead = store.session_by_name(conn, store.LEAD)
+            if lead is not None and lead["id"] != sid:
+                store.queue_message(conn, lead["id"], "fyi", "thunderhead-system", text, urgent=False)
+        store.post(conn, sid, "compacted", p.get("trigger", "auto"))
+
+
 def session_end(p):
     with store.db() as conn:
         sess = store.get_session(conn, p["session_id"])
@@ -259,6 +344,8 @@ HANDLERS = {
     "Notification": notification,
     "PermissionRequest": permission_request,
     "SessionEnd": session_end,
+    "StopFailure": stop_failure,
+    "PostCompact": post_compact,
 }
 
 
