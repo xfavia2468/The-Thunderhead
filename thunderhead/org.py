@@ -195,6 +195,8 @@ def spawn_dev(conn, team: str, directory: str, task: str, name: str, model: str 
     else:
         cwd = launch.workspace_dir(name)
     t = store.get_team(conn, team)
+    if t["archived"]:
+        return f"Team '{team}' was disbanded.", [], ""
     if by != "human" and above(model, t["max_model"]):
         return (f"Your team's max_model is {t['max_model']}. Spawn it on {t['max_model']}, then ask for {model} "
                 f"with request('model', {{'dev': '{name}', 'model': '{model}'}}, reason).", [], "")
@@ -269,8 +271,9 @@ def delete_check(conn, name) -> str | None:
     if name == store.LEAD:
         return "The Thunderhead can't be deleted. Use /wipe to give it a fresh start."
     role, team = store.rank(conn, name)
-    if role == "supervisor":
-        return f"'{name}' supervises team '{team}'. Deleting it would leave the team without an owner."
+    if role == "supervisor" and not store.team_archived(conn, team):
+        return (f"'{name}' supervises team '{team}'. Deleting it would leave the team without an owner; "
+                f"/disband the team first.")
     if store.session_by_name(conn, name) is None:
         return f"No session named '{name}'."
     return None
@@ -561,3 +564,37 @@ def task_line(t) -> str:
     owner = f" · @{t['owner']}" if t["owner"] else " · unassigned"
     branch = f" · `{t['branch']}`" if t["branch"] else ""
     return f"#{t['id']} **{t['title']}**{owner}{branch}"
+
+
+# --- disbanding -------------------------------------------------------------
+
+def disband(conn, team: str) -> dict:
+    """Retire a team in the store: archived, its channels closed, its memory folder moved to
+    teams/_archived/. Returns what the caller must do outside the store."""
+    import shutil
+    import time as _time
+    t = store.get_team(conn, team)
+    names = store.team_members_of(conn, team)
+    sessions = [s for s in (store.session_by_name(conn, n) for n in names) if s is not None]
+    for s in sessions:
+        store.set_status(conn, s["id"], "stopped")  # quiet SessionEnd; only the human could wake it
+    conn.execute("UPDATE teams SET archived=1 WHERE name=?", (team,))
+    channels = conn.execute("SELECT * FROM channels WHERE team=?", (team,)).fetchall()
+    conn.execute("UPDATE channels SET closed=1 WHERE team=?", (team,))
+    folder = launch.team_folder(team)
+    moved = None
+    if folder.exists():
+        dest = launch.TEAMS / "_archived" / team
+        if dest.exists():
+            dest = dest.with_name(f"{team}-{_time.strftime('%Y%m%d-%H%M')}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(folder), str(dest))
+        moved = dest
+    lead = store.session_by_name(conn, store.LEAD)
+    if lead is not None:
+        store.queue_message(conn, lead["id"], "fyi", "thunderhead-system",
+                            f"The human disbanded team '{team}' (supervisor {t['supervisor']}, "
+                            f"{len(names) - 1} devs). Its memory is archived at {moved or folder}. "
+                            "Remove it from your routing notes.", urgent=False)
+    return {"sessions": sessions, "channels": [c["discord_id"] for c in channels if c["discord_id"]],
+            "desk": t["desk_id"], "category": t["category_id"], "folder": moved}

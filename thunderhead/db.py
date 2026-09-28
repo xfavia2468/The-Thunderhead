@@ -197,6 +197,7 @@ MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN last_counted TEXT",               # last message id counted
     # Which version of the tools the session loaded (mcp_server.py's mtime), to spot stale ones.
     "ALTER TABLE sessions ADD COLUMN tools_version INTEGER",
+    "ALTER TABLE teams ADD COLUMN archived INTEGER DEFAULT 0",  # disbanded; kept as a record
 ]
 
 
@@ -468,7 +469,13 @@ def team_members_of(conn, team) -> list[str]:
 
 
 def all_teams(conn):
-    return conn.execute("SELECT * FROM teams ORDER BY created_at").fetchall()
+    """Active teams. Disbanded ones stay in the table as a record."""
+    return conn.execute("SELECT * FROM teams WHERE COALESCE(archived, 0)=0 ORDER BY created_at").fetchall()
+
+
+def team_archived(conn, team) -> bool:
+    t = get_team(conn, team) if team else None
+    return bool(t and t["archived"])
 
 
 def get_model(conn, name) -> tuple[str | None, str | None]:

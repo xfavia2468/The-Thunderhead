@@ -28,6 +28,7 @@ OWNER_ID = int(os.environ.get("DISCORD_OWNER_ID", "0") or 0)
 
 FLEET, NEEDS_YOU, CHATTER, LEAD_CHANNEL, ARCHIVED = "fleet", "needs-you", "agent-chatter", store.LEAD, "archived"
 GROUPS = "groups"  # Discord category that holds the group channels
+ARCHIVED_TEAMS = "archived teams"  # Discord category for disbanded teams' channels
 ICONS = look.ICONS
 # A quiet thread (say, a sleeping session's) drops out of the sidebar after a day. It's archived, not
 # deleted: board links still open it, and it comes back as soon as the session posts again.
@@ -641,6 +642,34 @@ class Thunderhead(discord.Client):
                                           "wakes it again."))
         await self.archive(thread)
 
+    async def disband_team(self, team: str) -> str:
+        """Retire a team: stop its sessions, archive its memory, and file its Discord channels away."""
+        with store.db() as conn:
+            gone = org.disband(conn, team)
+        for s in gone["sessions"]:
+            await run_claude(["claude", "stop", short_id(s["id"])])
+        archive_cat = discord.utils.get(self.guild.categories, name=ARCHIVED_TEAMS) \
+            or await self.guild.create_category(ARCHIVED_TEAMS)
+        channels = [ch for ch in (self.get_channel(i) for i in [gone["desk"], *gone["channels"]] if i) if ch]
+        for ch in channels:
+            try:
+                await ch.send(embed=look.card(
+                    f"This team was disbanded. The channel is kept read-only as the record, and the team's "
+                    f"memory is archived at `{gone['folder'] or 'teams/_archived/' + team}`.",
+                    title=f"📦 Team {team} disbanded", color=look.QUIET))
+                for thread in ch.threads:
+                    await self.archive(thread)
+                await ch.set_permissions(self.guild.default_role, send_messages=False,
+                                         send_messages_in_threads=False, create_public_threads=False)
+                await ch.edit(category=archive_cat)
+            except discord.HTTPException:
+                log.warning("Couldn't archive #%s", ch.name)
+        old_cat = self.get_channel(gone["category"]) if gone["category"] else None
+        if old_cat is not None and not old_cat.channels:
+            await old_cat.delete()
+        return (f"📦 Disbanded **{team}**: {len(gone['sessions'])} session(s) stopped, {len(channels)} channel(s) "
+                f"moved to **{ARCHIVED_TEAMS}** read-only, memory archived.")
+
     async def archive(self, thread):
         """Archive a finished session's thread. Nothing is lost; it unarchives if the session returns."""
         if isinstance(thread, discord.Thread) and not thread.archived:
@@ -1112,6 +1141,8 @@ class Thunderhead(discord.Client):
         with store.db() as conn:
             if self.usage_paused(conn):
                 return  # queued; delivered once the usage limit resets
+            if store.team_archived(conn, store.rank(conn, sess["name"])[1]):
+                return  # its team was disbanded
         self.waking.add(sid)
         try:
             # Never restart a session that's open in someone's terminal; it gets the
@@ -1531,6 +1562,44 @@ async def archive_cmd(interaction: discord.Interaction, session: str | None = No
     await bot.archive_session(sess, "you")
     await interaction.followup.send(embed=look.note(f"🗄️ Archived **{sess['name']}**. It's listed in #{ARCHIVED}."),
                                     ephemeral=True)
+
+
+class ConfirmDisband(discord.ui.View):
+    def __init__(self, team: str):
+        super().__init__(timeout=120)
+        self.team = team
+
+    async def interaction_check(self, interaction) -> bool:
+        return is_owner(interaction.user)
+
+    @discord.ui.button(label="Disband", style=discord.ButtonStyle.danger, emoji="📦")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=look.note(f"Disbanding **{self.team}**…"), view=None)
+        result = await bot.disband_team(self.team)
+        await interaction.edit_original_response(embed=look.note(result, look.GOOD))
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=look.note("Cancelled. Nothing changed."), view=None)
+
+
+@bot.tree.command(name="disband", description="Retire a team: stop its sessions and archive its memory and channels")
+@app_commands.autocomplete(team=team_names)
+async def disband(interaction: discord.Interaction, team: str):
+    if not await owner_only(interaction):
+        return
+    with store.db() as conn:
+        t = store.get_team(conn, team)
+        if t is None or t["archived"]:
+            await interaction.response.send_message(f"No active team `{team}`.", ephemeral=True)
+            return
+        members = store.team_members_of(conn, team)
+    await interaction.response.send_message(embed=look.card(
+        f"This stops its supervisor **{t['supervisor']}** and its {len(members) - 1} dev(s), keeping their "
+        f"conversations. Its memory folder moves to `teams/_archived/{team}`, and its Discord channels become "
+        f"read-only in **{ARCHIVED_TEAMS}**. Nothing is deleted. Documents that should outlive the team belong "
+        "in the fleet library.", title=f"📦 Disband team {team}?", color=look.APPROVAL),
+        view=ConfirmDisband(team), ephemeral=True)
 
 
 class ConfirmDelete(discord.ui.View):

@@ -71,7 +71,8 @@ On WSL, this starts the bot whenever WSL starts. WSL itself doesn't start with W
 | **Reply** on a #needs-you notice | Answer that session in a pop-up form, without leaving the channel. |
 | `/send session [message]` | Same as above, from anywhere. Leave out the message to write a longer one in a form. |
 | `/status` | Quick list of sessions. The pinned message in `#fleet` stays up to date too. |
-| `/delete session [keep_thread]` | Delete a session for good, after you confirm: its process, Claude job, fleet records and (unless `keep_thread`) its thread. The name is free again. Not for The Thunderhead (use `/wipe`) or supervisors. |
+| `/disband team` | Retire a team, after you confirm. Its supervisor and devs are stopped (conversations kept), its memory moves to `teams/_archived/`, and its Discord channels go read-only into an **archived teams** category. Nothing is deleted. |
+| `/delete session [keep_thread]` | Delete a session for good, after you confirm: its process, Claude job, fleet records and (unless `keep_thread`) its thread. The name is free again. Not for The Thunderhead (use `/wipe`), or a supervisor whose team is still active (`/disband` it first). |
 | `/archive [session]` | Done with a conversation: archive its thread now and put the session to sleep, instead of waiting. Anyone can still wake it with a message. Inside a thread, leave out the name. |
 | `/stop session` | Pause a session on purpose. It shows as ⏹️ stopped, and other agents can't wake it. A message from you still does. |
 | Approve / Deny / Deny with reason in `#needs-you` | Answer a permission prompt. A reason is passed to the session, so it knows what to do instead. |
