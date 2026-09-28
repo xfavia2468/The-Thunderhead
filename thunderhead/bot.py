@@ -61,7 +61,15 @@ def parse_reset(text: str) -> int | None:
     try:
         tz = ZoneInfo(m["tz"])
         now = datetime.now(tz)
-        when = datetime.strptime(f"{m['when'].strip()} {now.year}", "%b %d, %I:%M%p %Y").replace(tzinfo=tz)
+        text = f"{m['when'].strip()} {now.year}"
+        for fmt in ("%b %d, %I:%M%p %Y", "%b %d, %I%p %Y"):  # "2:59pm", or "3pm" on the hour
+            try:
+                when = datetime.strptime(text, fmt).replace(tzinfo=tz)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
         if when < now.replace(month=1, day=1) or (now - when).days > 180:
             when = when.replace(year=now.year + 1)
         return int(when.timestamp())
@@ -667,6 +675,15 @@ class Thunderhead(discord.Client):
         old_cat = self.get_channel(gone["category"]) if gone["category"] else None
         if old_cat is not None and not old_cat.channels:
             await old_cat.delete()
+        # A team lives in channels, not a thread, so it gets a card of its own in #archived.
+        with store.db() as conn:
+            t = store.get_team(conn, team)
+            members = store.team_members_of(conn, team)
+        await self.channels[ARCHIVED].send(embed=look.card(
+            f"Supervisor **{t['supervisor']}** and {len(members) - 1} dev(s), stopped with their conversations kept.\n"
+            + (" · ".join(ch.mention for ch in channels) or "") + "\n"
+            f"Memory: `{gone['folder'] or 'teams/_archived/' + team}`",
+            author=f"📦 Team {team} · disbanded", color=look.QUIET, footer="Disbanded"))
         return (f"📦 Disbanded **{team}**: {len(gone['sessions'])} session(s) stopped, {len(channels)} channel(s) "
                 f"moved to **{ARCHIVED_TEAMS}** read-only, memory archived.")
 
@@ -818,8 +835,10 @@ class Thunderhead(discord.Client):
             for s in rows:
                 if s["name"] in seen or not store.is_current(conn, s):
                     continue  # older rows of a resumed session
-                seen.add(s["name"])
                 role, team = store.rank(conn, s["name"])
+                if store.team_archived(conn, team):
+                    continue  # its team was disbanded; the team is listed in #archived
+                seen.add(s["name"])
                 key = ("👑 The Thunderhead" if role == "lead" else
                        f"🧭 Team {team} · {short_count(team_tokens(conn, team))} used" if team else "🛠️ Without a team")
                 groups.setdefault(key, []).append((role != "supervisor", self.session_line(conn, s)))
