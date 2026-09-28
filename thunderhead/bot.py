@@ -295,6 +295,11 @@ class Thunderhead(discord.Client):
         self.waking: set[str] = set()
         self.deleting: set[str] = set()
         self.wake_failed: dict[str, float] = {}  # session id -> time of last failed wake
+        self.issues: dict[str, dict] = {}  # health problems by key
+        self.resolved: list[int] = []  # alert messages to remove, their problems fixed
+        self.beats: dict[str, float] = {}  # loop -> when it last ran
+        self.hook_log_size: int | None = None
+        self.hook_errors_at = 0.0
 
     async def setup_hook(self):
         self.add_dynamic_items(ApprovalButton, RequestButton, ReplyButton, AckButton)
@@ -361,14 +366,20 @@ class Thunderhead(discord.Client):
 
     @tasks.loop(seconds=2)
     async def pump(self):
+        await self.guard("pump", self._pump)
+
+    async def _pump(self):
         """Post pending outbox events and approval requests."""
         with store.db() as conn:
             events = conn.execute("SELECT * FROM outbox WHERE posted_at IS NULL ORDER BY id LIMIT 20").fetchall()
             for ev in events:
                 try:
                     await self.post_event(conn, ev)
-                except Exception:
+                except Exception as e:
                     log.exception("Failed to post outbox event %s", ev["id"])
+                    self.problem("posting", f"Couldn't post a {ev['kind']} event to Discord: {e}")
+                else:
+                    self.fine("posting")
                 conn.execute("UPDATE outbox SET posted_at=? WHERE id=?", (store.now(), ev["id"]))
 
             for ap in conn.execute("SELECT * FROM approvals WHERE message_id IS NULL AND status='pending'").fetchall():
@@ -720,9 +731,14 @@ class Thunderhead(discord.Client):
 
     @tasks.loop(seconds=10)
     async def board(self):
+        await self.guard("board", self._board)
+
+    async def _board(self):
         """Keep the board in #fleet: one line per session, nothing hidden. If it outgrows one
         message it continues in more, kept together and edited in place."""
         await self.clear_needs_you()
+        self.check_health()
+        await self.send_alerts()
         with store.db() as conn:
             # Live sessions, plus ones that just ended (an hour) or were stopped (a day). A session
             # whose thread is archived is listed in #archived instead, so each appears in one place.
@@ -745,7 +761,7 @@ class Thunderhead(discord.Client):
             lines = []
             for key in order:
                 lines += ([""] if lines else []) + [f"**{key}**"] + [line for _, line in sorted(groups[key])]
-            pages = board_pages(lines)
+            pages = board_pages([self.health_line(), ""] + lines)
             if pages == self.last_board:
                 return
             ids = json.loads(store.kv_get(conn, "board_message_ids") or "[]")
@@ -793,14 +809,19 @@ class Thunderhead(discord.Client):
 
     @tasks.loop(seconds=5)
     async def liveness(self):
+        await self.guard("liveness", self._liveness)
+
+    async def _liveness(self):
         """Reconcile with `claude agents`: shut down sleepers, wake sessions with mail, mark dead ones gone."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "claude", "agents", "--json", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             out, _ = await asyncio.wait_for(proc.communicate(), 30)
             active = {a.get("sessionId"): a for a in json.loads(out or b"[]")}
-        except Exception:
+        except Exception as e:
+            self.problem("claude", f"`claude agents` failed, so sessions can't be woken, reaped or checked: {e!r}")
             return
+        self.fine("claude")
         pids = {a.get("pid") for a in active.values()}
         to_wake, to_reap = [], []
         with store.db() as conn:
@@ -864,6 +885,75 @@ class Thunderhead(discord.Client):
         for s in to_wake:
             asyncio.create_task(self.wake(s))
 
+    # -- health --
+
+    LOOP_INTERVALS = {"pump": 2, "board": 10, "liveness": 5}
+    ALERT_AFTER = 30  # seconds a problem must last before it pings the human
+
+    async def guard(self, name, body):
+        try:
+            await body()
+        except Exception as e:
+            log.exception("The %s loop failed", name)
+            self.problem(f"loop:{name}", f"The bot's {name} loop failed: {e!r}. It keeps retrying.")
+        else:
+            self.fine(f"loop:{name}")
+        self.beats[name] = time.time()
+
+    def problem(self, key: str, text: str):
+        if key not in self.issues:
+            self.issues[key] = {"since": time.time(), "text": text, "alert": None}
+        else:
+            self.issues[key]["text"] = text
+
+    def fine(self, key: str):
+        issue = self.issues.pop(key, None)
+        if issue and issue["alert"]:
+            self.resolved.append(issue["alert"])
+
+    def check_health(self):
+        """Problems the loops can't report themselves: a stalled loop, and new hook errors."""
+        now = time.time()
+        for name, every in self.LOOP_INTERVALS.items():
+            last = self.beats.get(name)
+            if last and now - last > max(60, every * 6):
+                self.problem(f"stall:{name}", f"The bot's {name} loop hasn't run for {int(now - last)}s.")
+            elif last:
+                self.fine(f"stall:{name}")
+        log_file = ROOT / "data" / "hook-errors.log"
+        size = log_file.stat().st_size if log_file.exists() else 0
+        if self.hook_log_size is not None and size > self.hook_log_size:
+            tail = log_file.read_text(errors="replace")[-600:]
+            self.problem("hooks", f"Session hooks logged new errors (data/hook-errors.log):\n```\n{tail}\n```")
+            self.hook_errors_at = now
+        elif "hooks" in self.issues and now - self.hook_errors_at > 1800:
+            self.fine("hooks")  # quiet for half an hour
+        self.hook_log_size = size
+
+    def health_line(self) -> str:
+        if not self.issues:
+            return "🩺 **Health:** all systems normal"
+        lines = [f"🩺 **Health: {len(self.issues)} problem{'s' if len(self.issues) > 1 else ''}**"]
+        lines += [f"⚠️ {i['text'].splitlines()[0][:150]}" for i in self.issues.values()]
+        return "\n".join(lines)
+
+    async def send_alerts(self):
+        """Ping the human about problems that have lasted, and clear alerts for fixed ones."""
+        ch = self.channels.get(NEEDS_YOU)
+        if ch is None:
+            return
+        while self.resolved:
+            try:
+                await (await ch.fetch_message(self.resolved.pop())).delete()
+            except discord.HTTPException:
+                pass
+        for key, issue in self.issues.items():
+            if issue["alert"] is None and time.time() - issue["since"] >= self.ALERT_AFTER:
+                msg = await ch.send(content=f"<@{OWNER_ID}>", embed=look.card(
+                    issue["text"][:3500], title="🩺 Something in THUNDERHEAD is failing", color=look.BAD,
+                    footer="This clears itself once it's fixed · the bot's log is data/bot.log"), view=ack_view())
+                issue["alert"] = msg.id
+
     async def refresh_stale(self, active: dict):
         """Sessions that loaded older tools get them on their next wake-up. So once an idle background
         session is running old tools, put it to sleep: the next message wakes it with the new ones.
@@ -882,6 +972,9 @@ class Thunderhead(discord.Client):
 
     @tasks.loop(seconds=MEMORY_SNAPSHOT_SECONDS)
     async def snapshot_memory(self):
+        await self.guard("snapshot_memory", self._snapshot_memory)
+
+    async def _snapshot_memory(self):
         """Commit whatever the lead sessions changed in the memory repo, so notes have history."""
         if not (MEMORY_ROOT / ".git").exists():
             return
@@ -892,6 +985,9 @@ class Thunderhead(discord.Client):
             code, text = await run_claude(git + ["commit", "-q", "-m", "Memory snapshot"])
             if code != 0:
                 log.warning("Memory snapshot failed: %s", text)
+                self.problem("memory", f"The memory repo snapshot failed: {text[-300:]}")
+            else:
+                self.fine("memory")
 
     def usage_paused(self, conn) -> dict | None:
         """The current usage-limit pause, unless it's time to let a wake-up through to probe it."""
