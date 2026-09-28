@@ -631,13 +631,16 @@ class Thunderhead(discord.Client):
                          (msg.id, sess["id"], store.now()))
         elif kind in ("agent_msg", "agent_msg_in"):
             # Bodies look like "📤 to **x** (hop 2): text" or "📥 from **x** (hop 2): text".
-            m = re.match(r"(📤 to|📥 from) \*\*(.+?)\*\* \(hop (\d+)\): (.*)", body, re.S)
-            arrow, other, hop, text = m.groups() if m else ("", "", "?", body)
+            # Bodies look like "📤 to **x** (hop 2, call): text".
+            m = re.match(r"(📤 to|📥 from) \*\*(.+?)\*\* \(hop (\d+)(?:, (call|note))?\): (.*)", body, re.S)
+            arrow, other, hop, how, text = m.groups() if m else ("", "", "?", None, body)
             header = f"{name} → {other}" if arrow.startswith("📤") else f"{other} → {name}"
-            await look.send_card(thread, text, author=f"💬 {header}", color=look.AGENTS, footer=f"hop {hop}")
+            icon, how = ("📣", "call") if how == "call" or how is None else ("📝", "note")
+            footer = f"{how} · hop {hop}"
+            await look.send_card(thread, text, author=f"{icon} {header}", color=look.AGENTS, footer=footer)
             if kind == "agent_msg":
-                await look.send_card(self.channels[CHATTER], text, author=f"💬 {header}", color=look.AGENTS,
-                                     footer=f"hop {hop}")
+                await look.send_card(self.channels[CHATTER], text, author=f"{icon} {header}", color=look.AGENTS,
+                                     footer=footer)
 
     async def post_request(self, conn, req):
         """A request the human must decide: charters go to the team's desk, everything else to #thunderhead."""
@@ -844,6 +847,16 @@ class Thunderhead(discord.Client):
             # message at its next turn there.
             if (await agent_info(sid) or {}).get("kind") == "interactive":
                 return
+            # A team caps how many of its devs are awake at once. A call from another session waits
+            # for a free slot (the next check tries again); one from the human goes through.
+            with store.db() as conn:
+                role, team = store.rank(conn, sess["name"])
+                if role == "dev":
+                    t = store.get_team(conn, team)
+                    from_human = conn.execute("SELECT 1 FROM messages WHERE to_session=? AND delivered_at IS NULL "
+                                              "AND urgent=1 AND from_kind='human'", (sid,)).fetchone()
+                    if not from_human and len(store.awake_devs(conn, team)) >= t["max_awake"]:
+                        return
             with store.db() as conn:
                 rows = store.take_messages(conn, sid)
                 if not rows:
@@ -944,11 +957,17 @@ class Thunderhead(discord.Client):
             if sess is None and group is None and channel.id != self.channels[LEAD_CHANNEL].id:
                 return
             if group is not None:
-                # @name pings those sessions; no mentions pings everyone, since you're the one asking.
-                mentioned = [m for m in re.findall(r"@([A-Za-z0-9_-]+)", message.content)
-                             if m in store.members(conn, group["name"])]
+                # @name calls those sessions. With no mentions, only the channel's coordinators are
+                # called (its team's supervisor, or the supervisors and The Thunderhead in it), and
+                # everyone else gets a note, so one message doesn't wake a whole team.
+                roster = store.members(conn, group["name"])
+                mentioned = [m for m in re.findall(r"@([A-Za-z0-9_-]+)", message.content) if m in roster]
+                if not mentioned:
+                    team = store.get_team(conn, group["team"]) if group["team"] else None
+                    mentioned = ([team["supervisor"]] if team else
+                                 [m for m in roster if store.rank(conn, m)[0] in ("lead", "supervisor")]) or ["all"]
                 got = store.fan_out(conn, group["name"], "human", message.author.display_name,
-                                    text, notify=mentioned or ["all"])
+                                    text, notify=mentioned, note_others=True)
                 targets = [store.session_by_name(conn, n) for n in got]
             elif sess is None:
                 targets = None  # no Thunderhead yet
@@ -1121,16 +1140,19 @@ class SpawnModal(OwnerOnly, discord.ui.Modal, title="Start a session"):
                        task="What the session should do. Leave it out to write it in a pop-up form",
                        name="Session name (letters, digits, - and _)", mode="Permission mode",
                        team="Put it on this team as a dev, reporting to the team's supervisor",
-                       oneoff="Delete it automatically once it's done and falls asleep (its thread is kept)")
+                       oneoff="Delete it automatically once it's done and falls asleep (its thread is kept)",
+                       model="Model to run on (default sonnet)")
 @app_commands.choices(mode=[app_commands.Choice(name=m, value=m)
-                            for m in ("default", "acceptEdits", "auto", "plan")])
+                            for m in ("default", "acceptEdits", "auto", "plan")],
+                      model=[app_commands.Choice(name=m, value=m) for m in config.MODELS])
 @app_commands.autocomplete(team=team_names)
 async def spawn(interaction: discord.Interaction, directory: str = "", task: str | None = None,
                 name: str | None = None, mode: app_commands.Choice[str] | None = None,
-                team: str | None = None, oneoff: bool = False):
+                team: str | None = None, oneoff: bool = False, model: app_commands.Choice[str] | None = None):
     if not await owner_only(interaction):
         return
-    options = {"mode": mode.value if mode else None, "team": team, "oneoff": oneoff}
+    options = {"mode": mode.value if mode else None, "team": team, "oneoff": oneoff,
+               "model": model.value if model else None}
     if task is None:
         await interaction.response.send_modal(SpawnModal(directory, name, options))
         return
@@ -1138,7 +1160,7 @@ async def spawn(interaction: discord.Interaction, directory: str = "", task: str
 
 
 async def do_spawn(interaction: discord.Interaction, directory: str, task: str, name: str | None,
-                   mode: str | None = None, team: str | None = None, oneoff: bool = False):
+                   mode: str | None = None, team: str | None = None, oneoff: bool = False, model: str | None = None):
     async def fail(text):
         await interaction.response.send_message(embed=look.card(text, title="Couldn't start it", color=look.BAD),
                                                 ephemeral=True)
@@ -1161,7 +1183,8 @@ async def do_spawn(interaction: discord.Interaction, directory: str, task: str, 
             if store.get_team(conn, team) is None:
                 await interaction.followup.send(f"No team `{team}`.", ephemeral=True)
                 return
-            err, cmd, _ = org.spawn_dev(conn, team, str(cwd), task, name)
+            # You're the authority: your spawns skip the team's awake and model limits.
+            err, cmd, _ = org.spawn_dev(conn, team, str(cwd), task, name, model or "", by="human")
             if not err:
                 org.fyi(conn, store.get_team(conn, team)["supervisor"],
                         f"The human spawned '{name}' onto your team with this task: {task[:1000]}")
@@ -1171,7 +1194,9 @@ async def do_spawn(interaction: discord.Interaction, directory: str, task: str, 
             return
         prompt = cmd.pop()
     else:
-        cmd, prompt = bg_command(name), task
+        cmd, prompt = bg_command(name, model=model), task
+        with store.db() as conn:
+            store.set_model(conn, name, model or config.DEFAULT_DEV_MODEL)
     if mode and mode != "default":
         cmd += ["--permission-mode", mode]
     code, text = await run_claude(cmd + [prompt], cwd=cwd)
@@ -1186,7 +1211,8 @@ async def do_spawn(interaction: discord.Interaction, directory: str, task: str, 
         with store.db() as conn:
             conn.execute("INSERT OR IGNORE INTO oneoffs (name) VALUES (?)", (name,))
     where = f"team {team}'s channel" if team else f"#{FLEET}"
-    fields = [("Folder", f"`{cwd}`", False), ("Thread", f"appears in {where} once it starts", True)]
+    fields = [("Folder", f"`{cwd}`", False), ("Thread", f"appears in {where} once it starts", True),
+              ("Model", model or config.DEFAULT_DEV_MODEL, True)]
     if oneoff:
         fields.append(("One-off", "deleted once it's done and falls asleep; its thread is kept", True))
     await interaction.followup.send(embed=look.card(task[:1500], title=f"🚀 Started {name}", color=look.GOOD,
@@ -1346,14 +1372,17 @@ async def cleanup(interaction: discord.Interaction, days: app_commands.Range[int
                                     ephemeral=True)
 
 
-@bot.tree.command(name="team-config", description="Set a team's autonomy and dev limit directly")
+@bot.tree.command(name="team-config", description="Set a team's autonomy, awake limit and model limit")
 @app_commands.describe(team="Team", autonomy="propose: works only on what it's given; act: picks up its own backlog",
-                       max_devs="The most devs the team may have")
-@app_commands.choices(autonomy=[app_commands.Choice(name=a, value=a) for a in org.AUTONOMY])
+                       max_awake="How many of its devs may be awake at once (it may keep any number)",
+                       max_model="The strongest model its supervisor may give a dev without asking")
+@app_commands.choices(autonomy=[app_commands.Choice(name=a, value=a) for a in org.AUTONOMY],
+                      max_model=[app_commands.Choice(name=m, value=m) for m in config.MODELS])
 @app_commands.autocomplete(team=team_names)
 async def team_config(interaction: discord.Interaction, team: str,
                       autonomy: app_commands.Choice[str] | None = None,
-                      max_devs: app_commands.Range[int, 0, 20] | None = None):
+                      max_awake: app_commands.Range[int, 0, 50] | None = None,
+                      max_model: app_commands.Choice[str] | None = None):
     if not await owner_only(interaction):
         return
     with store.db() as conn:
@@ -1361,14 +1390,17 @@ async def team_config(interaction: discord.Interaction, team: str,
         if t is None:
             await interaction.response.send_message(f"No team `{team}`.", ephemeral=True)
             return
-        if autonomy is None and max_devs is None:
+        if autonomy is None and max_awake is None and max_model is None:
             await interaction.response.send_message(embed=look.card(
                 title=f"🧭 Team {team}", color=look.SUPERVISOR, fields=[
-                    ("Autonomy", t["autonomy"], True), ("Devs", f"{store.dev_count(conn, team)} of {t['max_devs']}", True),
-                    ("Charter", t["charter_status"], True)]), ephemeral=True)
+                    ("Autonomy", t["autonomy"], True),
+                    ("Awake", f"{len(store.awake_devs(conn, team))} of {t['max_awake']}", True),
+                    ("Devs kept", str(store.dev_count(conn, team)), True),
+                    ("Max model", t["max_model"], True), ("Charter", t["charter_status"], True)]), ephemeral=True)
             return
         result = org.apply_config(conn, team, {"autonomy": autonomy.value if autonomy else None,
-                                              "max_devs": max_devs}, by="human")
+                                              "max_awake": max_awake,
+                                              "max_model": max_model.value if max_model else None}, by="human")
     await interaction.response.send_message(embed=look.note(f"⚙️ {result}", look.SUPERVISOR), ephemeral=True)
 
 

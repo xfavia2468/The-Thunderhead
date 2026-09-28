@@ -16,7 +16,7 @@ INTRO = """You are connected to THUNDERHEAD as session '{name}'. The human watch
 Use the `thunderhead` MCP tools:
 - status(state, summary): call when you start a task, get blocked, or finish. state is one of working, blocked, done.
 - report(message): send results, questions or anything the human should see. Keep it short; put long output in a file and give the path.
-- send(to, message): message another session by name. sessions() lists them.
+- send(to, message, wake=False): message another session by name. By default it's a note: the session reads it the next time it wakes, without being woken for it. Use wake=True to call it into action now, for a task, a question you need answered, or a report it's waiting for. sessions() lists them.
 - post(channel, message, notify): post to a group channel you're in, pinging the members in notify. channels() lists yours; read_channel() shows recent posts.
 - inbox(): check for new messages in the middle of a long task.
 Messages for you are also delivered automatically when your turn ends.
@@ -35,7 +35,7 @@ Besides every session's tools, you have: fleet(), create_team(), spawn_oneoff(),
 SUPERVISOR_INTRO = """You are the supervisor of team '{team}': its product owner. Your brief is in CLAUDE.md, your charter in CHARTER.md and your memory in NOTES.md, all in your working folder. Your team's repositories are readable through your extra directories: {repos}.
 The human can talk to you directly in your team's Discord desk channel; report() posts there. You answer to The Thunderhead ('thunderhead').
 Your devs: {devs}. Team channel: #{team}.
-Besides every session's tools, you have: team(), request(), withdraw_request(), archive_dev(), propose_charter(), and create_channel()/add_to_channel() for channels inside your team. Your settings (autonomy, max devs) and charter are in your CLAUDE.md."""
+Besides every session's tools, you have: team(), spawn_dev(), set_model(), request(), withdraw_request(), archive_dev(), propose_charter(), and create_channel()/add_to_channel() for channels inside your team. Your devs are your tools: sessions you keep for their context. Add them with spawn_dev() (no approval needed; max_awake limits how many run at once) and pick each one's model with set_model(). Your settings (autonomy, max awake, max model) and charter are in your CLAUDE.md."""
 
 DEV_TEAM_NOTE = """You're a dev on team '{team}'. Your supervisor is '{sup}': take work from it, and report to it with send('{sup}', ...) when you finish or get stuck. Team channel: #{team}. team() shows your teammates."""
 
@@ -51,19 +51,45 @@ def _default_name(sid: str, cwd: str) -> str:
     return f"{os.path.basename(cwd.rstrip('/')) or 'root'}-{sid[:4]}"
 
 
-def format_messages(rows, unread_channels=()) -> str:
-    parts = ["[thunderhead] New messages for you. Handle them, then carry on. "
-             "Reply to the human with `report`, to a session with `send`, and to a group channel with `post`."]
-    for r in rows:
-        who = {"human": "the human (Discord)", "lead": "The Thunderhead (acting for the human)",
-               "supervisor": f"supervisor '{r['from_name']}'", "fyi": "FYI"}.get(
-            r["from_kind"], f"agent '{r['from_name']}'")
-        if not r["urgent"] and r["from_kind"] != "fyi":
-            who = f"FYI, {who}"
-        where = f" in #{r['channel']} (you were pinged)" if r["channel"] else ""
-        parts.append(f"--- from {who}{where} ---\n{r['body']}")
+# Notes beyond this many characters go to a file, with the newest kept inline.
+NOTES_INLINE = 3000
+
+
+def _who(r) -> str:
+    who = {"human": "the human (Discord)", "lead": "The Thunderhead (acting for the human)",
+           "supervisor": f"supervisor '{r['from_name']}'", "fyi": "the system"}.get(
+        r["from_kind"], f"agent '{r['from_name']}'")
+    return who + (f" in #{r['channel']}" if r["channel"] else "")
+
+
+def format_messages(rows, unread_channels=(), name: str | None = None) -> str:
+    """What a session reads when messages are delivered. Notes (context gathered while it was away)
+    come first, then calls (what it's being asked to do now)."""
+    notes = [r for r in rows if not r["urgent"]]
+    calls = [r for r in rows if r["urgent"]]
+    parts = ["[thunderhead] Messages for you. Reply to the human with `report`, to a session with `send` "
+             "(wake=True if they must act on it), and to a group channel with `post`."]
+    if notes:
+        blocks = [f"--- note from {_who(r)} ---\n{r['body']}" for r in notes]
+        inline, size = [], 0
+        for block in reversed(blocks):  # newest first, until the budget runs out
+            if size + len(block) > NOTES_INLINE and inline:
+                break
+            inline.insert(0, block)
+            size += len(block)
+        header = "Notes left for you while you were away. They're context: take them in, and act only if they change your plans."
+        if len(inline) < len(blocks):
+            path = ROOT / "data" / "mailbox" / f"{name or 'session'}-{int(time.time())}.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n\n".join(blocks) + "\n")
+            header += (f" There were {len(blocks)}; the newest {len(inline)} are below, and all of them are in "
+                       f"{path}. Read it if the older ones might matter.")
+        parts += [header] + inline
+    if calls:
+        parts.append("Calls: act on these now." if notes else "Calls: act on these now.")
+        parts += [f"--- from {_who(r)} ---\n{r['body']}" for r in calls]
     if unread_channels:
-        parts.append("Also, posts you weren't pinged on (read them only if relevant, with read_channel): "
+        parts.append("Also, channel posts you weren't pinged on (read them only if relevant, with read_channel): "
                      + ", ".join(f"{n} in #{ch}" for ch, n in unread_channels))
     return "\n\n".join(parts)
 
@@ -71,7 +97,7 @@ def format_messages(rows, unread_channels=()) -> str:
 def delivery(conn, sid, rows) -> str:
     """The text a session gets for these messages, plus a note of unread channel posts."""
     sess = store.get_session(conn, sid)
-    return format_messages(rows, store.unread(conn, sess["name"]) if sess else ())
+    return format_messages(rows, store.unread(conn, sess["name"]) if sess else (), sess["name"] if sess else None)
 
 
 def _hops_after(rows) -> int:

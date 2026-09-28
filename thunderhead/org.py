@@ -11,10 +11,24 @@ from . import db as store
 from . import launch
 import secrets
 
-from .config import DEFAULT_MAX_DEVS, MAX_ONEOFFS, MAX_SESSIONS
+from .config import DEFAULT_DEV_MODEL, EFFORTS, MAX_ONEOFFS, MAX_SESSIONS, MODELS
 
-# What supervisors can ask for. 'charter' and 'config' only the human can approve.
-REQUEST_ACTIONS = ("spawn", "channel", "other")
+# What supervisors can ask The Thunderhead for: a model above their team's max_model for one
+# dev, a channel with other teams, or anything else. 'charter' and 'config' only the human
+# approves. Spawning needs no request: the team's max_awake limits what it can cost.
+REQUEST_ACTIONS = ("model", "channel", "other")
+
+
+def model_error(model: str | None, effort: str | None = None) -> str | None:
+    if model and model not in MODELS:
+        return f"model must be one of {', '.join(MODELS)}."
+    if effort and effort not in EFFORTS:
+        return f"effort must be one of {', '.join(EFFORTS)}."
+    return None
+
+
+def above(model: str, ceiling: str) -> bool:
+    return MODELS.index(model) > MODELS.index(ceiling)
 AUTONOMY = ("propose", "act")
 
 
@@ -125,8 +139,8 @@ def create_team(conn, name: str, charter: str, repos: list[str], topic: str = ""
     err = ceiling_error(conn)
     if err:
         return err, ""
-    conn.execute("INSERT INTO teams (name, topic, repos, supervisor, created_at, max_devs) VALUES (?, ?, ?, ?, ?, ?)",
-                 (name, topic, json.dumps(folders), sup, store.now(), DEFAULT_MAX_DEVS))
+    conn.execute("INSERT INTO teams (name, topic, repos, supervisor, created_at) VALUES (?, ?, ?, ?, ?)",
+                 (name, topic, json.dumps(folders), sup, store.now()))
     store.add_team_member(conn, name, sup)
     # The team's own channel, for the supervisor and devs. No Thunderhead: it talks to the supervisor.
     conn.execute("INSERT INTO channels (name, topic, created_by, created_at, team) VALUES (?, ?, ?, ?, ?)",
@@ -156,11 +170,17 @@ def join_team(conn, team: str, session_name: str):
     fyi(conn, t["supervisor"], f"'{session_name}' has joined your team as a dev.")
 
 
-def spawn_dev(conn, team: str, directory: str, task: str, name: str) -> tuple[str | None, list[str], str]:
+def spawn_dev(conn, team: str, directory: str, task: str, name: str, model: str = "", effort: str = "",
+              by: str = "") -> tuple[str | None, list[str], str]:
     """Validate and register a new dev. Returns (error, command, folder); the caller runs the command.
 
-    An empty directory gives the dev a fresh workspace of its own.
+    An empty directory gives the dev a fresh workspace of its own. by="human" may pick any model;
+    anyone else is held to the team's max_model.
     """
+    model = model or DEFAULT_DEV_MODEL
+    err = model_error(model, effort)
+    if err:
+        return err, [], ""
     if not launch.NAME_RE.match(name) or name == store.LEAD:
         return "Names can only use letters, digits, - and _ (and not 'thunderhead').", [], ""
     if store.session_by_name(conn, name) is not None:
@@ -175,24 +195,31 @@ def spawn_dev(conn, team: str, directory: str, task: str, name: str) -> tuple[st
     else:
         cwd = launch.workspace_dir(name)
     t = store.get_team(conn, team)
-    if store.dev_count(conn, team) >= t["max_devs"]:
-        return f"Team '{team}' is at its limit of {t['max_devs']} devs.", [], ""
+    if by != "human" and above(model, t["max_model"]):
+        return (f"Your team's max_model is {t['max_model']}. Spawn it on {t['max_model']}, then ask for {model} "
+                f"with request('model', {{'dev': '{name}', 'model': '{model}'}}, reason).", [], "")
+    awake = store.awake_devs(conn, team)
+    if by != "human" and len(awake) >= t["max_awake"]:
+        return (f"Team '{team}' already has {len(awake)} devs awake (its limit is {t['max_awake']}): "
+                f"{', '.join(awake)}. Wait for one to finish, or archive_dev() one that's done.", [], "")
     err = ceiling_error(conn)
     if err:
         return err, [], ""
     store.add_team_member(conn, team, name)
+    store.set_model(conn, name, model, effort or None)
     conn.execute("INSERT OR IGNORE INTO channel_members (channel, session_name, added_at) VALUES (?, ?, ?)",
                  (team, name, store.now()))
-    sup = store.get_team(conn, team)["supervisor"]
-    brief = (f"[thunderhead] You're a dev on team '{team}'. Your supervisor is '{sup}': it gives you work, and "
-             f"you report back to it with send('{sup}', ...) when you finish or get stuck. Team channel: #{team}.\n\n"
-             f"Your task:\n{task}")
-    return None, launch.bg_command(name, dev=True) + [brief], str(cwd)
+    sup = t["supervisor"]
+    brief = (f"[thunderhead] You're a specialist on team '{team}', running on {model}. Your supervisor '{sup}' "
+             f"keeps you for your context and calls on you for work. When you finish or get stuck, report back "
+             f"with send('{sup}', ..., wake=True). Team channel: #{team}.\n\nYour task:\n{task}")
+    return None, launch.bg_command(name, dev=True, model=model, effort=effort or None) + [brief], str(cwd)
 
 
 def undo_spawn(conn, team: str, name: str):
     conn.execute("DELETE FROM team_members WHERE team=? AND session_name=?", (team, name))
     conn.execute("DELETE FROM channel_members WHERE channel=? AND session_name=?", (team, name))
+    conn.execute("DELETE FROM session_models WHERE name=?", (name,))
 
 
 ONEOFF_BRIEF = """[thunderhead] You're a one-off session, started by The Thunderhead for a single task. You're not on a team.
@@ -203,7 +230,7 @@ Your task:
 {task}"""
 
 
-def spawn_oneoff(conn, lead, directory: str, task: str, name: str = "") -> tuple[str | None, list[str], str, str]:
+def spawn_oneoff(conn, lead, directory: str, task: str, name: str = "", model: str = "") -> tuple[str | None, list[str], str, str]:
     """Validate and register a one-off for The Thunderhead. Returns (error, command, folder, name)."""
     if directory:
         cwd = Path(directory).expanduser()
@@ -226,10 +253,15 @@ def spawn_oneoff(conn, lead, directory: str, task: str, name: str = "") -> tuple
     err = ceiling_error(conn)
     if err:
         return err, [], "", ""
+    model = model or DEFAULT_DEV_MODEL
+    err = model_error(model)
+    if err:
+        return err, [], "", ""
     cwd = cwd or launch.workspace_dir(name)
     conn.execute("INSERT INTO oneoffs (name, by_lead) VALUES (?, 1)", (name,))
+    store.set_model(conn, name, model)
     store.post(conn, lead["id"], "report", f"🧩 Started one-off **{name}** in `{cwd}`: {task[:300]}")
-    return None, launch.bg_command(name) + [ONEOFF_BRIEF.format(task=task)], str(cwd), name
+    return None, launch.bg_command(name, model=model) + [ONEOFF_BRIEF.format(task=task)], str(cwd), name
 
 
 def delete_check(conn, name) -> str | None:
@@ -304,15 +336,17 @@ def create_request(conn, me, action: str, params: dict, reason: str, replaces: i
         return f"action must be one of {', '.join(REQUEST_ACTIONS)}."
     if not reason.strip():
         return "Say why: The Thunderhead needs a reason to approve it."
-    need = {"spawn": ("task", "name"), "channel": ("name", "members")}.get(action, ())
+    if action == "spawn":
+        return "Spawning doesn't need a request any more: use spawn_dev() directly."
+    need = {"model": ("dev", "model"), "channel": ("name", "members")}.get(action, ())
     missing = [k for k in need if not params.get(k)]
     if missing:
         return f"A {action} request needs: {', '.join(missing)}."
-    if action == "spawn" and params.get("directory") and launch.forbidden_dir(Path(params["directory"])):
-        return launch.forbidden_dir(Path(params["directory"]))
-    if action == "spawn" and store.dev_count(conn, team["name"]) >= team["max_devs"]:
-        return (f"Your team is at its limit of {team['max_devs']} devs. If it really needs more, ask The "
-                "Thunderhead to raise the limit (request('other', ...) with your reason), or free up a dev.")
+    if action == "model":
+        err = model_error(params["model"], params.get("effort"))
+        role, their_team = store.rank(conn, params["dev"])
+        if err or role != "dev" or their_team != team["name"]:
+            return err or f"'{params['dev']}' isn't one of your devs."
     cur = conn.execute("INSERT INTO requests (from_name, team, action, params, reason, created_at) "
                        "VALUES (?, ?, ?, ?, ?, ?)",
                        (me["name"], team["name"], action, json.dumps(params), reason, store.now()))
@@ -350,10 +384,9 @@ def decide(conn, req_id: int, approve: bool, note: str, by: str) -> tuple[str, l
         conn.execute("UPDATE teams SET charter_status='approved' WHERE name=?", (req["team"],))
         result = "The charter is now in force; the supervisor loads it at its next start."
     if approve:
-        if req["action"] == "spawn":
-            err, cmd, cwd = spawn_dev(conn, req["team"], params.get("directory", ""), params["task"], params["name"])
-            if err:
-                approve, note = False, f"{note} (couldn't do it: {err})".strip()
+        if req["action"] == "model":
+            store.set_model(conn, params["dev"], params["model"], params.get("effort"))
+            result = f"'{params['dev']}' runs on {params['model']} from its next wake-up."
         elif req["action"] == "channel":
             result = create_channel(conn, req["from_name"], params["name"], params.get("members", []),
                                     params.get("topic", ""))
@@ -364,8 +397,8 @@ def decide(conn, req_id: int, approve: bool, note: str, by: str) -> tuple[str, l
                  (status, note, store.now(), req_id))
     who = "the human" if by == "human" else "The Thunderhead"
     outcome = f"Your request #{req_id} ({req['action']}) was {status} by {who}."
-    if approve and req["action"] == "spawn":
-        outcome += f" '{params['name']}' is starting and will report to you."
+    if approve and result:
+        outcome += f" {result}"
     if note:
         outcome += f"\nNote: {note}"
     if req["from_name"] != store.LEAD:
@@ -377,20 +410,25 @@ def decide(conn, req_id: int, approve: bool, note: str, by: str) -> tuple[str, l
 
 # --- team settings ----------------------------------------------------------
 
+SETTINGS = ("autonomy", "max_awake", "max_model")
+
+
 def loosens(team, changes: dict) -> list[str]:
     """Which changes give a team more room (these need the human's yes)."""
     out = []
     if changes.get("autonomy") == "act" and team["autonomy"] != "act":
         out.append("autonomy → act")
-    if changes.get("max_devs") is not None and changes["max_devs"] > team["max_devs"]:
-        out.append(f"max_devs {team['max_devs']} → {changes['max_devs']}")
+    if changes.get("max_awake") is not None and changes["max_awake"] > team["max_awake"]:
+        out.append(f"max_awake {team['max_awake']} → {changes['max_awake']}")
+    if changes.get("max_model") and above(changes["max_model"], team["max_model"]):
+        out.append(f"max_model {team['max_model']} → {changes['max_model']}")
     return out
 
 
 def apply_config(conn, team_name: str, changes: dict, by: str) -> str:
-    """Set a team's autonomy and/or max_devs, then tell the human and the supervisor."""
+    """Set a team's settings, then tell the human and the supervisor."""
     team = store.get_team(conn, team_name)
-    sets = {k: v for k, v in changes.items() if k in ("autonomy", "max_devs") and v is not None}
+    sets = {k: v for k, v in changes.items() if k in SETTINGS and v is not None}
     for k, v in sets.items():
         conn.execute(f"UPDATE teams SET {k}=? WHERE name=?", (v, team_name))
     summary = ", ".join(f"{k}={v}" for k, v in sets.items())
@@ -415,16 +453,22 @@ def request_config(conn, lead, team_name: str, changes: dict, reason: str) -> st
         return f"No team '{team_name}'."
     if changes.get("autonomy") not in (None, *AUTONOMY):
         return f"autonomy must be one of {', '.join(AUTONOMY)}."
-    if changes.get("max_devs") is not None and not 0 <= changes["max_devs"] <= 20:
-        return "max_devs must be between 0 and 20."
+    if changes.get("max_awake") is not None and not 0 <= changes["max_awake"] <= 50:
+        return "max_awake must be between 0 and 50."
+    err = model_error(changes.get("max_model"))
+    if err:
+        return err.replace("model", "max_model", 1)
+    changes = {k: v for k, v in changes.items() if k in SETTINGS and v is not None}
     looser = loosens(team, changes)
-    tighter = {k: v for k, v in changes.items() if v is not None
-               and not (k == "autonomy" and v == "act") and not (k == "max_devs" and v > team["max_devs"])}
+    loose_keys = {k for k, v in changes.items()
+                  if (k == "autonomy" and v == "act") or (k == "max_awake" and v > team["max_awake"])
+                  or (k == "max_model" and above(v, team["max_model"]))}
+    tighter = {k: v for k, v in changes.items() if k not in loose_keys}
     out = []
     if tighter:
         out.append(apply_config(conn, team_name, tighter, by=store.LEAD))
     if looser:
-        wide = {k: v for k, v in changes.items() if v is not None and k not in tighter}
+        wide = {k: changes[k] for k in loose_keys}
         cur = conn.execute("INSERT INTO requests (from_name, team, action, params, reason, status, created_at) "
                            "VALUES (?, ?, 'config', ?, ?, 'escalated', ?)",
                            (lead["name"], team_name, json.dumps(wide), reason, store.now()))

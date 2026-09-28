@@ -47,8 +47,13 @@ POLL_SECONDS = 1.5
 
 # Team defaults, and a fleet-wide ceiling on running sessions that only the human sets.
 # Per-team caps alone don't bound the total, since The Thunderhead can create teams.
-DEFAULT_MAX_DEVS = int(os.environ.get("THUNDERHEAD_DEFAULT_MAX_DEVS", 3))
 MAX_SESSIONS = int(os.environ.get("THUNDERHEAD_MAX_SESSIONS", 10))
+# Models, by alias so they track the latest release. Lead sessions (The Thunderhead and
+# supervisors) always run the strongest; devs and one-offs default to a cheaper one.
+MODELS = ("haiku", "sonnet", "opus")  # cheapest first
+LEAD_MODEL = os.environ.get("THUNDERHEAD_LEAD_MODEL", "opus")
+DEFAULT_DEV_MODEL = os.environ.get("THUNDERHEAD_DEV_MODEL", "sonnet")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # One-off sessions The Thunderhead may have running at once (the human's own don't count).
 MAX_ONEOFFS = int(os.environ.get("THUNDERHEAD_MAX_ONEOFFS", 2))
 

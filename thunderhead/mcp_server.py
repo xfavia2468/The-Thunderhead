@@ -102,10 +102,13 @@ def report(message: str) -> str:
 
 
 @tool
-def send(to: str, message: str) -> str:
+def send(to: str, message: str, wake: bool = False) -> str:
     """Send a private message to another Claude session by name.
 
-    It is delivered when that session's turn ends. A sleeping session is woken to receive it.
+    wake=False (the default) leaves a note: the session reads it the next time it wakes, and isn't
+    woken for it. Use that for context and updates. wake=True calls it into action: it gets the
+    message when its current turn ends, or is woken if asleep. Use a call when it must act now:
+    handing it a task, a question you need answered, or a report someone is waiting for.
     """
     with store.db() as conn:
         me = _me(conn)
@@ -126,12 +129,21 @@ def send(to: str, message: str) -> str:
         hops = _hops(conn, me, [to])
         if hops is None:
             return hops_refusal()
-        store.queue_message(conn, target["id"], org._kind(conn, me["name"]), me["name"], message, hops=hops)
-        store.post(conn, me["id"], "agent_msg", f"📤 to **{target['name']}** (hop {hops}): {message}")
-        store.post(conn, target["id"], "agent_msg_in", f"📥 from **{me['name']}** (hop {hops}): {message}")
+        store.queue_message(conn, target["id"], org._kind(conn, me["name"]), me["name"], message, hops=hops,
+                            urgent=wake)
+        kind = "call" if wake else "note"
+        store.post(conn, me["id"], "agent_msg", f"📤 to **{target['name']}** (hop {hops}, {kind}): {message}")
+        store.post(conn, target["id"], "agent_msg_in", f"📥 from **{me['name']}** (hop {hops}, {kind}): {message}")
+    if not wake:
+        return f"Left a note for {to}. It reads it the next time it wakes; use wake=True if it must act now."
     if target["status"] in store.DEAD + (store.SLEEPING,):
-        return f"Queued for {to}. It isn't running and will be woken to receive it (about 20 seconds)."
-    return f"Queued for {to}."
+        with store.db() as conn:
+            t = store.get_team(conn, team) if role == "dev" else None
+            if t is not None and len(store.awake_devs(conn, team)) >= t["max_awake"]:
+                return (f"Called {to}, but team {team} already has {t['max_awake']} devs awake, so it waits for a "
+                        "slot and wakes when one frees up.")
+        return f"Called {to}. It isn't running, so it's being woken to receive it (about 20 seconds)."
+    return f"Called {to}. It gets this when its current turn ends."
 
 
 @tool
@@ -221,12 +233,13 @@ def team() -> str:
         if t is None:
             return "You're not on a team."
         lines = [f"Team {t['name']}: {t['topic'] or ''} (repos: {', '.join(json.loads(t['repos']))})",
-                 f"Settings: autonomy={t['autonomy']}, max_devs={t['max_devs']} "
-                 f"({store.dev_count(conn, t['name'])} now), charter {t['charter_status']}",
+                 f"Settings: autonomy={t['autonomy']}, max_awake={t['max_awake']} "
+                 f"({len(store.awake_devs(conn, t['name']))} awake now), max_model={t['max_model']}, "
+                 f"charter {t['charter_status']}",
                  f"Team channel: #{t['name']}"]
         for name in store.team_members_of(conn, t["name"]):
             s = store.session_by_name(conn, name)
-            label = "supervisor" if name == t["supervisor"] else "dev"
+            label = "supervisor" if name == t["supervisor"] else f"dev, {store.get_model(conn, name)[0] or '?'}"
             lines.append(f"- {name} ({label}) [{s['status'] if s else 'not started'}] {(s and s['summary']) or ''}")
     return "\n".join(lines)
 
@@ -324,14 +337,62 @@ def propose_charter(text: str, summary: str) -> str:
         return org.propose_charter(conn, me, text, summary)
 
 
-def request(action: str, details: dict, reason: str, replaces: int = 0) -> str:
-    """Ask The Thunderhead to do something only it can do. It approves, rejects, or asks the human.
+def spawn_dev(name: str, task: str, directory: str = "", model: str = "", effort: str = "") -> str:
+    """Add a tool to your toolbox: a new dev session with its own context, for a kind of work.
 
-    action: "spawn" (details: task, name, and directory: the product repo to work in, or leave it
-    out for a fresh empty workspace; never your own folder) for a new dev on your team, "channel"
-    (details: name, members, topic) for a channel with other teams' sessions, or "other"
-    (details: anything) for everything else. reason: why the team needs it.
+    Name it for its specialty (billing-api, not dev2). task: what it's for and what to do first; it builds
+    its context from this. directory: the product repo it works in, or leave it empty for a fresh
+    workspace (never your own folder). model: "haiku", "sonnet" (default) or "opus", up to your team's
+    max_model; for complex planning or architecture, ask for opus with request("model", ...). effort:
+    "low" to "max", optional. No approval needed; your team's max_awake limits how many run at once.
+    """
+    with store.db() as conn:
+        me, _, team = _require(conn, "supervisor")
+        err, cmd, cwd = org.spawn_dev(conn, team, directory, task, name, model, effort, by=me["name"])
+        if err:
+            return err
+        org.fyi(conn, store.LEAD, f"{me['name']} added '{name}' to team {team} ({model or config.DEFAULT_DEV_MODEL}): "
+                                  f"{task[:300]}")
+    code, text = launch.run(cmd, cwd=cwd)
+    if code != 0:
+        with store.db() as conn:
+            org.undo_spawn(conn, team, name)
+        return f"'{name}' didn't start:\n{text}"
+    return f"'{name}' is starting. It'll report back to you with a call when it's done or stuck."
+
+
+def set_model(dev: str, model: str = "", effort: str = "") -> str:
+    """Change which model (and effort) one of your devs runs on, from its next wake-up.
+
+    Match the model to the work: haiku for simple lookups, sonnet for most coding, opus for complex
+    planning and architecture. Above your team's max_model, ask with request("model", ...). A switch
+    makes the dev re-read its whole context once at full price, so choose for its role, not per task.
+    """
+    with store.db() as conn:
+        me, _, team = _require(conn, "supervisor")
+        role, their_team = store.rank(conn, dev)
+        if role != "dev" or their_team != team:
+            return f"'{dev}' isn't one of your devs."
+        err = org.model_error(model or None, effort or None)
+        if err:
+            return err
+        t = store.get_team(conn, team)
+        if model and org.above(model, t["max_model"]):
+            return (f"Your team's max_model is {t['max_model']}. Ask for {model} with "
+                    f"request('model', {{'dev': '{dev}', 'model': '{model}'}}, reason).")
+        store.set_model(conn, dev, model or None, effort or None)
+        now_model, now_effort = store.get_model(conn, dev)
+    return f"'{dev}' will run on {now_model}" + (f" at {now_effort} effort" if now_effort else "") + " from its next wake-up."
+
+
+def request(action: str, details: dict, reason: str, replaces: int = 0) -> str:
+    """Ask The Thunderhead for something only it can grant. It approves, rejects, or asks the human.
+
+    action: "model" (details: dev, model, effort) to run one of your devs above your team's max_model,
+    for example opus for complex planning or architecture; "channel" (details: name, members, topic)
+    for a channel with other teams' sessions; or "other" (details: anything). reason: why.
     replaces: the number of an earlier request of yours that this one supersedes; it's withdrawn.
+    You don't need a request to spawn a dev: use spawn_dev().
     """
     with store.db() as conn:
         me, _, _ = _require(conn, "supervisor")
@@ -369,7 +430,7 @@ def fleet() -> str:
             teamed.update(members)
             lines.append(f"- {t['name']}: {t['topic'] or ''} (supervisor {t['supervisor']}; "
                          f"repos: {', '.join(json.loads(t['repos']))}; autonomy={t['autonomy']}, "
-                         f"max_devs={t['max_devs']}, charter {t['charter_status']})")
+                         f"max_awake={t['max_awake']}, max_model={t['max_model']}, charter {t['charter_status']})")
             lines += [line(m) + (" (supervisor)" if m == t["supervisor"] else "") for m in members]
         if len(lines) == 1:
             lines.append("- none")
@@ -386,7 +447,7 @@ def fleet() -> str:
 
 
 def create_team(name: str, charter: str, repos: list[str], topic: str = "", supervisor: str = "",
-                autonomy: str = "", max_devs: int = -1) -> str:
+                autonomy: str = "", max_awake: int = -1, max_model: str = "") -> str:
     """Create a team for a project or domain and start its supervisor.
 
     charter: a first draft of the team's mandate: what it owns (and doesn't), goals, definition of
@@ -395,7 +456,8 @@ def create_team(name: str, charter: str, repos: list[str], topic: str = "", supe
     repos: the folders the team works in (the supervisor can read them). supervisor: its session name
     (default '<name>-sup'). The team gets a Discord category, a desk channel for talking to the
     supervisor, and a team channel.
-    autonomy ("propose" or "act") and max_devs (default 3): set them here if the human said, rather
+    autonomy ("propose" or "act"), max_awake (devs awake at once, default 3) and max_model (the strongest
+    model the supervisor may pick itself, default "sonnet"): set them here if the human said, rather
     than writing them into the charter. Giving more room than the defaults goes to the human's buttons.
     """
     with store.db() as conn:
@@ -405,11 +467,11 @@ def create_team(name: str, charter: str, repos: list[str], topic: str = "", supe
             return err
         t = store.get_team(conn, name.lower())
         settings_note = ""
-        if autonomy or max_devs >= 0:
+        if autonomy or max_awake >= 0 or max_model:
             lead = _lead(conn)
             settings_note = " " + org.request_config(conn, lead, t["name"], {
-                "autonomy": autonomy or None, "max_devs": max_devs if max_devs >= 0 else None},
-                "set when the team was created")
+                "autonomy": autonomy or None, "max_awake": max_awake if max_awake >= 0 else None,
+                "max_model": max_model or None}, "set when the team was created")
             t = store.get_team(conn, t["name"])
         cmd, cwd = launch.supervisor_command(t)
     code, text = launch.run(cmd, cwd=cwd)
@@ -418,15 +480,16 @@ def create_team(name: str, charter: str, repos: list[str], topic: str = "", supe
     return f"Team '{t['name']}' created. Its supervisor '{sup}' is starting and will introduce itself.{settings_note}"
 
 
-def spawn_oneoff(directory: str, task: str, name: str = "") -> str:
+def spawn_oneoff(directory: str, task: str, name: str = "", model: str = "") -> str:
     """Start a one-off session outside any team for a small, self-contained job that no team owns and
-    that won't need follow-up. directory: the folder it works in, or "" for a fresh empty workspace. It reports its result to you and is deleted automatically once done
+    that won't need follow-up. directory: the folder it works in, or "" for a fresh empty workspace.
+    model: "haiku", "sonnet" (default) or "opus"; pick the cheapest that can do the job. It reports its result to you and is deleted automatically once done
     (its thread stays as the record). At most a couple can run at once. Anything that belongs to a
     team's product, or is ongoing, goes to that team's supervisor instead.
     """
     with store.db() as conn:
         lead = _lead(conn)
-        err, cmd, cwd, name = org.spawn_oneoff(conn, lead, directory, task, name)
+        err, cmd, cwd, name = org.spawn_oneoff(conn, lead, directory, task, name, model)
         if err:
             return err
     code, text = launch.run(cmd, cwd=cwd)
@@ -491,18 +554,20 @@ def escalate_request(request_id: int, note: str) -> str:
     return f"Request #{request_id} is with the human now."
 
 
-def set_team_config(team: str, reason: str, autonomy: str = "", max_devs: int = -1) -> str:
+def set_team_config(team: str, reason: str, autonomy: str = "", max_awake: int = -1, max_model: str = "") -> str:
     """Change a team's settings, as the human's instructions call for.
 
     autonomy: "propose" (only works on what it's given, proposes what's next) or "act" (picks up its
-    own backlog). max_devs: the most devs the team may have. Tightening (propose, a lower cap) applies
-    at once. Loosening (act, a higher cap) goes to the human's Approve/Reject buttons: quote their
-    words in reason if they asked for it. The human and the supervisor are told either way.
+    own backlog). max_awake: how many of its devs may be awake at once (it may keep any number).
+    max_model: the strongest model ("haiku", "sonnet", "opus") its supervisor may give a dev without
+    asking. Tightening applies at once. Loosening (act, more awake, a stronger model) goes to the
+    human's Approve/Reject buttons: quote their words in reason if they asked for it.
     """
     with store.db() as conn:
         lead = _lead(conn)
         return org.request_config(conn, lead, team, {"autonomy": autonomy or None,
-                                                    "max_devs": max_devs if max_devs >= 0 else None}, reason)
+                                                    "max_awake": max_awake if max_awake >= 0 else None,
+                                                    "max_model": max_model or None}, reason)
 
 
 def remove_from_channel(channel: str, sessions: list[str]) -> str:
@@ -566,7 +631,8 @@ def emergency_stop(session: str, reason: str) -> str:
     return f"Stopped {session}. The human and its supervisor have been told."
 
 
-SUPERVISOR_TOOLS = (create_channel, add_to_channel, request, withdraw_request, archive_dev, propose_charter)
+SUPERVISOR_TOOLS = (spawn_dev, set_model, create_channel, add_to_channel, request, withdraw_request, archive_dev,
+                    propose_charter)
 LEAD_TOOLS = (fleet, create_team, spawn_oneoff, join_team, set_team_config, requests, approve_request, reject_request, escalate_request,
               create_channel, add_to_channel, remove_from_channel, close_channel, emergency_stop)
 for fn in {"lead": LEAD_TOOLS, "supervisor": SUPERVISOR_TOOLS}.get(os.environ.get("THUNDERHEAD_ROLE"), ()):

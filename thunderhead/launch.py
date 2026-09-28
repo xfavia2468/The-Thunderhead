@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 from . import db as store
-from .config import BRIEFS, MCP_FILE, MEMORY_ROOT, SETTINGS_FILE, WORKSPACES
+from .config import BRIEFS, DEFAULT_DEV_MODEL, LEAD_MODEL, MCP_FILE, MEMORY_ROOT, SETTINGS_FILE, WORKSPACES
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 HQ = MEMORY_ROOT / "hq"
@@ -143,7 +143,8 @@ def team_folder(team: str) -> Path:
 
 
 def bg_command(name: str, resume: str | None = None, role: str = "worker",
-               team: str | None = None, add_dirs=(), dev: bool = False) -> list[str]:
+               team: str | None = None, add_dirs=(), dev: bool = False,
+               model: str | None = None, effort: str | None = None) -> list[str]:
     """`claude --bg` connected to the fleet, listening, with approvals sent to Discord.
 
     `--resume` has to come straight after `--bg`, and `--mcp-config`/`--add-dir` take several
@@ -161,6 +162,10 @@ def bg_command(name: str, resume: str | None = None, role: str = "worker",
         settings["env"]["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
     cmd = ["claude", "--bg"] + (["--resume", resume] if resume else [])
     cmd += ["-n", name, "--settings", json.dumps(settings), f"--mcp-config={MCP_FILE}"]
+    # Lead sessions always get the strongest model; everyone else what they were given.
+    cmd += ["--model", LEAD_MODEL if role in ("lead", "supervisor") else (model or DEFAULT_DEV_MODEL)]
+    if effort:
+        cmd += ["--effort", effort]
     if dev:
         # How to be a dev in the fleet. A system-prompt addition rather than a CLAUDE.md, so the
         # product repo stays untouched and it survives compaction.
@@ -175,11 +180,12 @@ def relaunch_command(conn, sess, resume: str | None = None) -> list[str]:
         prepare_supervisor(team)
         return bg_command(sess["name"], resume, role="supervisor", team=team["name"],
                           add_dirs=json.loads(team["repos"]))
+    model, effort = store.get_model(conn, sess["name"])
     if team:
-        return bg_command(sess["name"], resume, role=sess["role"], dev=True)
+        return bg_command(sess["name"], resume, role=sess["role"], dev=True, model=model, effort=effort)
     if sess["role"] == "lead":
         install_lead()
-    return bg_command(sess["name"], resume, role=sess["role"])
+    return bg_command(sess["name"], resume, role=sess["role"], model=model, effort=effort)
 
 
 def ensure_memory() -> None:
@@ -253,8 +259,11 @@ def prepare_supervisor(team) -> Path:
             "Pick up work from your backlog on your own, within your charter."
             if team["autonomy"] == "act" else
             "Only work on what you're given. When a task is done, propose what to do next and wait for a yes.")
-        + f"\n- **Max devs: {team['max_devs']}.** Requests beyond this are refused; ask The Thunderhead "
-          "with a reason if the team needs more.\n\n"
+        + f"\n- **Max awake: {team['max_awake']}.** How many of your devs may be awake at once. There's no limit "
+          "on how many you keep: a sleeping dev costs nothing. At the limit, a spawn is refused and calls to "
+          "sleeping devs wait for a free slot.\n"
+          f"- **Max model: {team['max_model']}.** The strongest model you may give a dev yourself. For a dev "
+          "that needs more, ask The Thunderhead with request('model', ...).\n\n"
         f"## Charter ({status})\n\n{charter}\n"))
     if not (folder / "NOTES.md").exists():
         (folder / "NOTES.md").write_text(SUPERVISOR_NOTES_TEMPLATE.format(team=team["name"]))

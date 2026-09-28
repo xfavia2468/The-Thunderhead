@@ -124,6 +124,13 @@ CREATE TABLE IF NOT EXISTS needs_you_posts (
     created_at REAL
 );
 
+-- The model (and effort) a dev or one-off runs on. By name, so it survives being woken.
+CREATE TABLE IF NOT EXISTS session_models (
+    name   TEXT PRIMARY KEY,
+    model  TEXT NOT NULL,
+    effort TEXT
+);
+
 -- Sessions spawned as one-offs: deleted automatically once they finish and fall asleep.
 CREATE TABLE IF NOT EXISTS oneoffs (name TEXT PRIMARY KEY);
 
@@ -160,10 +167,14 @@ MIGRATIONS = [
     # Team settings. autonomy: 'propose' (only works on what it's given, suggests what's next)
     # or 'act' (picks up its own backlog). charter_status: 'draft' until the human approves it.
     "ALTER TABLE teams ADD COLUMN autonomy TEXT DEFAULT 'propose'",
-    "ALTER TABLE teams ADD COLUMN max_devs INTEGER DEFAULT 3",
+    "ALTER TABLE teams ADD COLUMN max_devs INTEGER DEFAULT 3",  # no longer used; see max_awake
     "ALTER TABLE teams ADD COLUMN charter_status TEXT DEFAULT 'draft'",
     "ALTER TABLE oneoffs ADD COLUMN by_lead INTEGER DEFAULT 0",  # spawned by The Thunderhead
     "ALTER TABLE approvals ADD COLUMN reason TEXT",  # the human's reason when denying
+    # Teams limit how many devs are awake at once, not how many exist: a sleeping dev costs
+    # nothing. max_model is the strongest model the supervisor may pick without asking.
+    "ALTER TABLE teams ADD COLUMN max_awake INTEGER DEFAULT 3",
+    "ALTER TABLE teams ADD COLUMN max_model TEXT DEFAULT 'sonnet'",
 ]
 
 # The lead session: its name, and the role that unlocks its tools.
@@ -358,19 +369,24 @@ def channels_of(conn, session_name) -> list[str]:
         "WHERE m.session_name=? AND c.closed=0 ORDER BY c.created_at", (session_name,))]
 
 
-def fan_out(conn, channel, from_kind, from_name, body, notify, hops=0) -> list[str]:
-    """Log a channel post, and deliver it to the members in `notify` ("all" means every member).
+def fan_out(conn, channel, from_kind, from_name, body, notify, hops=0, note_others=False) -> list[str]:
+    """Log a channel post, and call the members in `notify` ("all" means every member).
 
-    Members who weren't notified aren't interrupted; they see it as unread. Returns who was notified.
+    Members who weren't called aren't interrupted: they see it as unread, or, with note_others,
+    get it as a note they read the next time they wake. Returns who was called.
     """
     everyone = [m for m in members(conn, channel) if from_kind == "human" or m != from_name]
     wanted = everyone if "all" in notify else [m for m in everyone if m in notify]
     got = []
-    for name in wanted:
+    for name in everyone:
         target = session_by_name(conn, name)
-        if target is not None:
+        if target is None:
+            continue
+        if name in wanted:
             queue_message(conn, target["id"], from_kind, from_name, body, hops=hops, channel=channel)
             got.append(name)
+        elif note_others:
+            queue_message(conn, target["id"], from_kind, from_name, body, hops=hops, channel=channel, urgent=False)
     conn.execute("INSERT INTO channel_log (channel, from_kind, from_name, body, notified, created_at) "
                  "VALUES (?, ?, ?, ?, ?, ?)", (channel, from_kind, from_name, body, json.dumps(got), now()))
     return got
@@ -425,6 +441,28 @@ def team_members_of(conn, team) -> list[str]:
 
 def all_teams(conn):
     return conn.execute("SELECT * FROM teams ORDER BY created_at").fetchall()
+
+
+def get_model(conn, name) -> tuple[str | None, str | None]:
+    row = conn.execute("SELECT model, effort FROM session_models WHERE name=?", (name,)).fetchone()
+    return (row["model"], row["effort"]) if row else (None, None)
+
+
+def set_model(conn, name, model: str | None = None, effort: str | None = None):
+    cur_model, cur_effort = get_model(conn, name)
+    conn.execute("INSERT OR REPLACE INTO session_models (name, model, effort) VALUES (?, ?, ?)",
+                 (name, model or cur_model or "sonnet", effort if effort is not None else cur_effort))
+
+
+def awake_devs(conn, team) -> list[str]:
+    """A team's devs that are up right now (not asleep, not stopped or ended)."""
+    t = get_team(conn, team)
+    out = []
+    for name in team_members_of(conn, team):
+        s = session_by_name(conn, name)
+        if name != t["supervisor"] and s is not None and s["status"] not in DEAD and s["status"] != SLEEPING:
+            out.append(name)
+    return out
 
 
 def dev_count(conn, team) -> int:
