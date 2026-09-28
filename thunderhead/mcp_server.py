@@ -102,13 +102,15 @@ def report(message: str) -> str:
 
 
 @tool
-def send(to: str, message: str, wake: bool = False) -> str:
+def send(to: str, message: str, wake: bool | None = None) -> str:
     """Send a private message to another Claude session by name.
 
-    wake=False (the default) leaves a note: the session reads it the next time it wakes, and isn't
-    woken for it. Use that for context and updates. wake=True calls it into action: it gets the
-    message when its current turn ends, or is woken if asleep. Use a call when it must act now:
-    handing it a task, a question you need answered, or a report someone is waiting for.
+    A note: the session reads it the next time it wakes, and isn't woken for it. Use that for
+    context and updates. A call: it gets the message when its current turn ends, or is woken if
+    asleep. Use a call when it must act now: handing it a task, or a question you need answered.
+    By default, messages up the chain (to your supervisor, or to The Thunderhead) are calls, since
+    someone is usually waiting for them, and everything else is a note. wake=True or wake=False
+    overrides that.
     """
     with store.db() as conn:
         me = _me(conn)
@@ -129,6 +131,8 @@ def send(to: str, message: str, wake: bool = False) -> str:
         hops = _hops(conn, me, [to])
         if hops is None:
             return hops_refusal()
+        if wake is None:
+            wake = store.is_up(conn, me["name"], to)
         store.queue_message(conn, target["id"], org._kind(conn, me["name"]), me["name"], message, hops=hops,
                             urgent=wake)
         kind = "call" if wake else "note"

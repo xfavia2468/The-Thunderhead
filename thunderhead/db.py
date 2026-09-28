@@ -491,6 +491,16 @@ def rank(conn, session_name) -> tuple[str, str | None]:
     return ("supervisor" if team["supervisor"] == session_name else "dev"), team["name"]
 
 
+def is_up(conn, sender, recipient) -> bool:
+    """True when a message goes up the org chart: to the sender's own supervisor, or to The
+    Thunderhead from a supervisor or a session without a team."""
+    s_role, s_team = rank(conn, sender)
+    r_role, r_team = rank(conn, recipient)
+    if r_role == "lead":
+        return s_role in ("supervisor", "unteamed")
+    return r_role == "supervisor" and s_role == "dev" and r_team == s_team
+
+
 def is_down(conn, sender, recipient) -> bool:
     """True when a message goes down the org chart: from the lead, or from a supervisor to its own dev."""
     s_role, s_team = rank(conn, sender)

@@ -16,7 +16,7 @@ INTRO = """You are connected to THUNDERHEAD as session '{name}'. The human watch
 Use the `thunderhead` MCP tools:
 - status(state, summary): call when you start a task, get blocked, or finish. state is one of working, blocked, done.
 - report(message): send results, questions or anything the human should see. Keep it short; put long output in a file and give the path.
-- send(to, message, wake=False): message another session by name. By default it's a note: the session reads it the next time it wakes, without being woken for it. Use wake=True to call it into action now, for a task, a question you need answered, or a report it's waiting for. sessions() lists them.
+- send(to, message, wake): message another session by name. Messages up the chain (to your supervisor, or to The Thunderhead) are calls by default: they wake the recipient to act. Everything else is a note by default: read the next time the recipient wakes, without waking it. Pass wake=True to call anyone into action now (a task, a question you need answered), or wake=False to leave a note. sessions() lists them.
 - post(channel, message, notify): post to a group channel you're in, pinging the members in notify. channels() lists yours; read_channel() shows recent posts.
 - inbox(): check for new messages in the middle of a long task.
 Messages for you are also delivered automatically when your turn ends.

@@ -5,7 +5,8 @@ import subprocess
 from pathlib import Path
 
 from . import db as store
-from .config import BRIEFS, DEFAULT_DEV_MODEL, LEAD_MODEL, MCP_FILE, MEMORY_ROOT, SETTINGS_FILE, WORKSPACES
+from .config import (BRIEFS, DEFAULT_DEV_MODEL, LEAD_MODEL, MCP_FILE, MEMORY_ROOT, SETTINGS_FILE,
+                     SUPERVISOR_MODEL, WORKSPACES)
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 HQ = MEMORY_ROOT / "hq"
@@ -162,8 +163,8 @@ def bg_command(name: str, resume: str | None = None, role: str = "worker",
         settings["env"]["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
     cmd = ["claude", "--bg"] + (["--resume", resume] if resume else [])
     cmd += ["-n", name, "--settings", json.dumps(settings), f"--mcp-config={MCP_FILE}"]
-    # Lead sessions always get the strongest model; everyone else what they were given.
-    cmd += ["--model", LEAD_MODEL if role in ("lead", "supervisor") else (model or DEFAULT_DEV_MODEL)]
+    # Lead sessions get their configured model; everyone else what they were given.
+    cmd += ["--model", {"lead": LEAD_MODEL, "supervisor": SUPERVISOR_MODEL}.get(role) or model or DEFAULT_DEV_MODEL]
     if effort:
         cmd += ["--effort", effort]
     if dev:
