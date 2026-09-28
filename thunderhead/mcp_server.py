@@ -294,6 +294,25 @@ def add_to_channel(channel: str, sessions: list[str]) -> str:
     return f"Added {', '.join(new) or 'nobody new'} to #{channel}."
 
 
+def archive_dev(name: str) -> str:
+    """File away one of your devs whose work is done for now: it goes to sleep and its thread is archived
+    (listed in #archived). It isn't lost: any message, from you or anyone, wakes it with its full context.
+    Not for devs that are mid-task. Deleting a dev is the human's call; ask with request("other", ...).
+    """
+    with store.db() as conn:
+        me, _, team = _require(conn, "supervisor")
+        role, their_team = store.rank(conn, name)
+        target = store.session_by_name(conn, name)
+        if target is None or role != "dev" or their_team != team:
+            return f"'{name}' isn't one of your devs. team() lists them."
+        if target["status"] in ("working", "needs_you", "waking"):
+            return f"'{name}' is {target['status']} right now. Let it finish first."
+        if target["thread_id"] is None:
+            return f"'{name}' has no thread to archive yet."
+        store.post(conn, target["id"], "archive", me["name"])
+    return f"Archiving '{name}'. It'll show in #archived, and a message wakes it again."
+
+
 def propose_charter(text: str, summary: str) -> str:
     """Send your team's charter to the human for approval, once you've refined the draft.
 
@@ -547,7 +566,7 @@ def emergency_stop(session: str, reason: str) -> str:
     return f"Stopped {session}. The human and its supervisor have been told."
 
 
-SUPERVISOR_TOOLS = (create_channel, add_to_channel, request, withdraw_request, propose_charter)
+SUPERVISOR_TOOLS = (create_channel, add_to_channel, request, withdraw_request, archive_dev, propose_charter)
 LEAD_TOOLS = (fleet, create_team, spawn_oneoff, join_team, set_team_config, requests, approve_request, reject_request, escalate_request,
               create_channel, add_to_channel, remove_from_channel, close_channel, emergency_stop)
 for fn in {"lead": LEAD_TOOLS, "supervisor": SUPERVISOR_TOOLS}.get(os.environ.get("THUNDERHEAD_ROLE"), ()):

@@ -32,6 +32,9 @@ ICONS = look.ICONS
 # A quiet thread (say, a sleeping session's) drops out of the sidebar after a day. It's archived, not
 # deleted: board links still open it, and it comes back as soon as the session posts again.
 THREAD_ARCHIVE_MINUTES = 1440
+# Files the human attaches in Discord are saved here, so sessions can read them.
+ATTACHMENTS = ROOT / "data" / "attachments"
+ATTACHMENT_LIMIT = 25_000_000
 
 
 def board_pages(lines: list[str]) -> list[str]:
@@ -560,6 +563,21 @@ class Thunderhead(discord.Client):
         e.timestamp = archived_at
         return e
 
+    async def archive_session(self, sess, by: str):
+        """Put a session to sleep and archive its thread: done for now, but any message wakes it."""
+        if sess["status"] not in store.DEAD and sess["status"] != store.SLEEPING:
+            # Asleep, not stopped, so anyone can still wake it. SessionEnd stays quiet for sleepers.
+            with store.db() as conn:
+                store.set_status(conn, sess["id"], store.SLEEPING)
+            info = await agent_info(sess["id"])
+            if info and info.get("kind") == "background":
+                await run_claude(["claude", "stop", short_id(sess["id"])])
+        with store.db() as conn:
+            thread = await self.thread_for(conn, sess)
+        await thread.send(embed=look.note(f"🗄️ **Archived by {by}.** A message here, or from another session, "
+                                          "wakes it again."))
+        await self.archive(thread)
+
     async def archive(self, thread):
         """Archive a finished session's thread. Nothing is lost; it unarchives if the session returns."""
         if isinstance(thread, discord.Thread) and not thread.archived:
@@ -581,6 +599,12 @@ class Thunderhead(discord.Client):
             await self.post_request(conn, org.get_request(conn, int(body)))
             return
         name = sess["name"]
+        if kind == "archive":
+            if sess["status"] in ("working", "needs_you", "waking"):
+                org.fyi(conn, body, f"Couldn't archive {name}: it became busy ({sess['status']}) before I got to it.")
+            else:
+                await self.archive_session(sess, f"its supervisor, {body}")
+            return
         if kind == "report":
             await look.send_card(thread, body, author=look.who(conn, name), color=look.role_color(conn, name))
         elif kind == "status":
@@ -896,6 +920,18 @@ class Thunderhead(discord.Client):
         channel = message.channel
         with store.db() as conn:
             group = store.channel_by_discord(conn, channel.id)
+            session_channel = (channel.id == self.channels[LEAD_CHANNEL].id or group is not None
+                               or store.session_by_thread(conn, channel.id) is not None
+                               or conn.execute("SELECT 1 FROM teams WHERE desk_id=?", (channel.id,)).fetchone())
+        if not session_channel:
+            return
+        if not is_owner(message.author):
+            await message.add_reaction("⛔")
+            return
+        text = await self.with_attachments(message)
+        if not text.strip():
+            return  # nothing to deliver (a sticker, say)
+        with store.db() as conn:
             if channel.id == self.channels[LEAD_CHANNEL].id:
                 sess = store.session_by_name(conn, store.LEAD)
                 if sess is not None and sess["status"] == "wiped":
@@ -907,29 +943,46 @@ class Thunderhead(discord.Client):
                 sess = store.session_by_name(conn, desk["supervisor"]) if desk else None
             if sess is None and group is None and channel.id != self.channels[LEAD_CHANNEL].id:
                 return
-            if not is_owner(message.author):
-                await message.add_reaction("⛔")
-                return
             if group is not None:
                 # @name pings those sessions; no mentions pings everyone, since you're the one asking.
                 mentioned = [m for m in re.findall(r"@([A-Za-z0-9_-]+)", message.content)
                              if m in store.members(conn, group["name"])]
                 got = store.fan_out(conn, group["name"], "human", message.author.display_name,
-                                    message.content, notify=mentioned or ["all"])
+                                    text, notify=mentioned or ["all"])
                 targets = [store.session_by_name(conn, n) for n in got]
             elif sess is None:
                 targets = None  # no Thunderhead yet
             else:
-                store.queue_message(conn, sess["id"], "human", message.author.display_name, message.content)
+                store.queue_message(conn, sess["id"], "human", message.author.display_name, text)
                 targets = [sess]
-                self.copy_up(conn, sess["name"], message.content)
+                self.copy_up(conn, sess["name"], text)
         if targets is None:
-            await self.start_lead(first_message=message.content)
+            await self.start_lead(first_message=text)
             await message.add_reaction("⚡")
             return
         await message.add_reaction("📨")
         for t in targets:
             await self.deliver_now(t, message if group is None else None)
+
+    async def with_attachments(self, message: discord.Message) -> str:
+        """The message's text, plus its attachments saved to disk. Sessions read the local copy
+        (images included); Discord's links expire after about a day, so they're only a fallback."""
+        text = message.content
+        lines = []
+        for att in message.attachments:
+            if att.size > ATTACHMENT_LIMIT:
+                lines.append(f"- {att.filename} ({att.size // 1_000_000} MB, too big to save): {att.url}")
+                continue
+            path = ATTACHMENTS / str(message.id) / Path(att.filename).name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                await att.save(path)
+                lines.append(f"- {path} ({att.content_type or 'file'}; original link: {att.url})")
+            except discord.HTTPException:
+                lines.append(f"- {att.filename} (couldn't be saved): {att.url}")
+        if lines:
+            text += ("\n\n" if text else "") + "Attached:\n" + "\n".join(lines)
+        return text
 
     def copy_up(self, conn, name, text):
         """When the human goes around a level, tell the level they skipped (as an FYI, not a task),
@@ -1169,18 +1222,7 @@ async def archive_cmd(interaction: discord.Interaction, session: str | None = No
             "interrupt it.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    running = sess["status"] not in store.DEAD and sess["status"] != store.SLEEPING
-    if running:
-        # Asleep, not stopped: anyone can still wake it with a message. SessionEnd stays quiet for sleepers.
-        with store.db() as conn:
-            store.set_status(conn, sess["id"], store.SLEEPING)
-        info = await agent_info(sess["id"])
-        if info and info.get("kind") == "background":
-            await run_claude(["claude", "stop", short_id(sess["id"])])
-    with store.db() as conn:
-        thread = await bot.thread_for(conn, sess)
-    await thread.send(embed=look.note("🗄️ **Archived by you.** A message here, or from another session, wakes it again."))
-    await bot.archive(thread)
+    await bot.archive_session(sess, "you")
     await interaction.followup.send(embed=look.note(f"🗄️ Archived **{sess['name']}**. It's listed in #{ARCHIVED}."),
                                     ephemeral=True)
 
