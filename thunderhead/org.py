@@ -528,3 +528,36 @@ def history(conn, names: list[str], hours: float, limit: int) -> list[str]:
         text = " ".join(text.split())
         out.append(f"[{when}] {text[:300]}{'…' if len(text) > 300 else ''}")
     return out
+
+
+# --- tasks ------------------------------------------------------------------
+
+TASK_STATUSES = ("todo", "doing", "review", "blocked", "done", "dropped")
+
+
+def add_task(conn, team: str, title: str, detail: str, owner: str | None, by: str) -> int:
+    cur = conn.execute("INSERT INTO tasks (team, title, detail, owner, created_by, created_at, updated_at) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?)", (team, title, detail, owner or None, by, store.now(), store.now()))
+    return cur.lastrowid
+
+
+def get_task(conn, task_id: int):
+    return conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+
+
+def update_task(conn, task_id: int, **changes):
+    sets = {k: v for k, v in changes.items() if v not in (None, "")}
+    if sets:
+        conn.execute(f"UPDATE tasks SET {', '.join(f'{k}=?' for k in sets)}, updated_at=? WHERE id=?",
+                     (*sets.values(), store.now(), task_id))
+
+
+def team_tasks(conn, team: str, include_done: bool = False):
+    q = "SELECT * FROM tasks WHERE team=?" + ("" if include_done else " AND status NOT IN ('done','dropped')")
+    return conn.execute(q + " ORDER BY id", (team,)).fetchall()
+
+
+def task_line(t) -> str:
+    owner = f" · @{t['owner']}" if t["owner"] else " · unassigned"
+    branch = f" · `{t['branch']}`" if t["branch"] else ""
+    return f"#{t['id']} **{t['title']}**{owner}{branch}"

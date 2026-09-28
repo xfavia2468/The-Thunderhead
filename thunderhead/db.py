@@ -124,6 +124,21 @@ CREATE TABLE IF NOT EXISTS needs_you_posts (
     created_at REAL
 );
 
+-- A team's work items: the supervisor's backlog, made visible. owner is a dev's session name.
+CREATE TABLE IF NOT EXISTS tasks (
+    id         INTEGER PRIMARY KEY,
+    team       TEXT NOT NULL,
+    title      TEXT NOT NULL,
+    detail     TEXT DEFAULT '',
+    owner      TEXT,
+    status     TEXT NOT NULL DEFAULT 'todo',  -- todo | doing | review | blocked | done | dropped
+    branch     TEXT,
+    note       TEXT DEFAULT '',
+    created_by TEXT,
+    created_at REAL,
+    updated_at REAL
+);
+
 -- The model (and effort) a dev or one-off runs on. By name, so it survives being woken.
 CREATE TABLE IF NOT EXISTS session_models (
     name   TEXT PRIMARY KEY,

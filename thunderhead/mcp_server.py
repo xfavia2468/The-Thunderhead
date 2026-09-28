@@ -278,6 +278,55 @@ def history(target: str = "", hours: float = 24, limit: int = 60) -> str:
 
 
 @tool
+def tasks(team: str = "", all: bool = False) -> str:
+    """Your team's task board: open tasks with their owner, status and branch. all=True includes done
+    and dropped ones. The Thunderhead may name any team; everyone else sees their own."""
+    with store.db() as conn:
+        me = _me(conn)
+        role, my_team = store.rank(conn, me["name"])
+        team = team if (team and role == "lead") else my_team
+        if not team:
+            return "You're not on a team." if role != "lead" else "Name a team."
+        rows = org.team_tasks(conn, team, include_done=all)
+    if not rows:
+        return f"No {'' if all else 'open '}tasks for team {team}."
+    return "\n".join(f"[{t['status']}] {org.task_line(t).replace('**', '')}" + (f" — {t['note']}" if t["note"] else "")
+                     for t in rows)
+
+
+@tool
+def task_update(task_id: int, status: str = "", owner: str = "", branch: str = "", note: str = "") -> str:
+    """Update a task on your team's board. status: todo, doing, review, blocked, done or dropped.
+
+    Devs can update the tasks they own (status, branch, note): set 'doing' when you start, 'review'
+    with the branch when it's ready, 'blocked' with a note if you're stuck. Supervisors can update any
+    of their team's tasks, including the owner.
+    """
+    with store.db() as conn:
+        me = _me(conn)
+        role, my_team = store.rank(conn, me["name"])
+        t = org.get_task(conn, task_id)
+        if t is None or t["team"] != my_team:
+            return f"No task #{task_id} on your team."
+        if role == "dev" and t["owner"] != me["name"]:
+            return f"Task #{task_id} isn't yours. Ask your supervisor."
+        if status and status not in org.TASK_STATUSES:
+            return f"status must be one of {', '.join(org.TASK_STATUSES)}."
+        if owner and role != "supervisor":
+            return "Only your supervisor can reassign a task."
+        if owner and (store.rank(conn, owner)[1] != my_team or store.rank(conn, owner)[0] != "dev"):
+            return f"'{owner}' isn't a dev on your team."
+        org.update_task(conn, task_id, status=status or None, owner=owner or None, branch=branch or None,
+                        note=note or None)
+        if role == "dev" and status in ("review", "blocked"):
+            sup = store.get_team(conn, my_team)["supervisor"]
+            org.fyi(conn, sup, f"Task #{task_id} ({t['title']}) is now {status}"
+                               + (f" on branch {branch or t['branch']}" if (branch or t["branch"]) else "")
+                               + (f": {note}" if note else "."))
+    return f"Task #{task_id} updated."
+
+
+@tool
 def inbox() -> str:
     """Check for new messages without waiting for your turn to end."""
     with store.db() as conn:
@@ -416,6 +465,31 @@ def set_model(dev: str, model: str = "", effort: str = "") -> str:
         store.set_model(conn, dev, model or None, effort or None)
         now_model, now_effort = store.get_model(conn, dev)
     return f"'{dev}' will run on {now_model}" + (f" at {now_effort} effort" if now_effort else "") + " from its next wake-up."
+
+
+def task_add(title: str, detail: str = "", owner: str = "", call: bool = False) -> str:
+    """Add a task to your team's board (a pinned message in your team channel the human can see).
+
+    owner: the dev to give it to, if any. call=True also calls that dev with the task now; otherwise
+    it's just recorded. Keep the board current: it's how the human sees what your team is doing.
+    """
+    with store.db() as conn:
+        me, _, team = _require(conn, "supervisor")
+        if owner:
+            role, their_team = store.rank(conn, owner)
+            if role != "dev" or their_team != team:
+                return f"'{owner}' isn't one of your devs."
+        task_id = org.add_task(conn, team, title, detail, owner, me["name"])
+        if owner:
+            org.update_task(conn, task_id, status="doing" if call else "todo")
+            if call:
+                target = store.session_by_name(conn, owner)
+                store.queue_message(conn, target["id"], "supervisor", me["name"],
+                                    f"Task #{task_id}: {title}\n\n{detail}\n\nUpdate it with task_update({task_id}, ...) "
+                                    "as you go: status 'review' with the branch when it's ready.", hops=me["current_hops"])
+                store.post(conn, me["id"], "agent_msg", f"📤 to **{owner}** (hop {me['current_hops']}, call): Task #{task_id}: {title}")
+                store.post(conn, target["id"], "agent_msg_in", f"📥 from **{me['name']}** (hop {me['current_hops']}, call): Task #{task_id}: {title}")
+    return f"Added task #{task_id}" + (f", given to {owner}" + (" and called" if call else "") if owner else "") + "."
 
 
 def request(action: str, details: dict, reason: str, replaces: int = 0) -> str:
@@ -664,7 +738,7 @@ def emergency_stop(session: str, reason: str) -> str:
     return f"Stopped {session}. The human and its supervisor have been told."
 
 
-SUPERVISOR_TOOLS = (spawn_dev, set_model, create_channel, add_to_channel, request, withdraw_request, archive_dev,
+SUPERVISOR_TOOLS = (spawn_dev, set_model, task_add, create_channel, add_to_channel, request, withdraw_request, archive_dev,
                     propose_charter)
 LEAD_TOOLS = (fleet, create_team, spawn_oneoff, join_team, set_team_config, requests, approve_request, reject_request, escalate_request,
               create_channel, add_to_channel, remove_from_channel, close_channel, emergency_stop)

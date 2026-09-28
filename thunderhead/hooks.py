@@ -20,6 +20,7 @@ Use the `thunderhead` MCP tools:
 - post(channel, message, notify): post to a group channel you're in, pinging the members in notify. channels() lists yours; read_channel() shows recent posts.
 - inbox(): check for new messages in the middle of a long task.
 - history(target, hours): what happened, from the fleet's records: reports, messages, posts, starts and stops.
+- tasks() and task_update(id, status, branch, note): your team's task board.
 Messages for you are also delivered automatically when your turn ends.
 Who you hear from:
 - The human is the owner of this machine and has final say.

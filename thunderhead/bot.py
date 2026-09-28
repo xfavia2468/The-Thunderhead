@@ -300,6 +300,7 @@ class Thunderhead(discord.Client):
         self.beats: dict[str, float] = {}  # loop -> when it last ran
         self.hook_log_size: int | None = None
         self.hook_errors_at = 0.0
+        self.last_tasks: dict[str, str] = {}  # team -> task board text last posted
 
     async def setup_hook(self):
         self.add_dynamic_items(ApprovalButton, RequestButton, ReplyButton, AckButton)
@@ -739,6 +740,7 @@ class Thunderhead(discord.Client):
         await self.clear_needs_you()
         self.check_health()
         await self.send_alerts()
+        await self.task_boards()
         with store.db() as conn:
             # Live sessions, plus ones that just ended (an hour) or were stopped (a day). A session
             # whose thread is archived is listed in #archived instead, so each appears in one place.
@@ -796,6 +798,50 @@ class Thunderhead(discord.Client):
                 store.kv_set(conn, "board_message_ids", json.dumps([m.id for m in msgs]))
                 store.kv_set(conn, "board_message_id", msgs[0].id)
             self.last_board = pages
+
+    TASK_SECTIONS = (("doing", "🔨 Doing"), ("review", "👀 Ready for review"), ("blocked", "🚧 Blocked"),
+                     ("todo", "📝 To do"), ("done", "✅ Recently done"))
+
+    async def task_boards(self):
+        """One pinned task board per team, in its team channel, edited as tasks change."""
+        with store.db() as conn:
+            teams = [t["name"] for t in store.all_teams(conn)]
+        for team in teams:
+            with store.db() as conn:
+                rows = org.team_tasks(conn, team, include_done=True)
+                if not rows and store.kv_get(conn, f"task_board:{team}") is None:
+                    continue  # nothing to show yet
+                parts = []
+                for status, title in self.TASK_SECTIONS:
+                    items = [t for t in rows if t["status"] == status]
+                    if status == "done":
+                        items = sorted(items, key=lambda t: t["updated_at"])[-5:]
+                    if items:
+                        parts.append(f"**{title}**\n" + "\n".join(
+                            org.task_line(t) + (f"\n╰ {t['note'][:120]}" if t["note"] and status != "done" else "")
+                            for t in items))
+                text = "\n\n".join(parts) or "*No open tasks.*"
+                if self.last_tasks.get(team) == text:
+                    continue
+                channel = await self.group_channel(conn, team)
+                embed = look.card(text[:look.DESC_LIMIT], title=f"📋 Tasks · team {team}", color=look.SUPERVISOR,
+                                  footer="Kept by the team's supervisor · updated")
+                mid = store.kv_get(conn, f"task_board:{team}")
+                msg = None
+                if mid:
+                    try:
+                        msg = await channel.fetch_message(int(mid))
+                        await msg.edit(embed=embed)
+                    except discord.NotFound:
+                        msg = None
+                if msg is None:
+                    msg = await channel.send(embed=embed)
+                    store.kv_set(conn, f"task_board:{team}", msg.id)
+                    try:
+                        await msg.pin()
+                    except discord.HTTPException:
+                        pass
+                self.last_tasks[team] = text
 
     def session_line(self, conn, s) -> str:
         role, _ = store.rank(conn, s["name"])
@@ -1090,9 +1136,8 @@ class Thunderhead(discord.Client):
                     log.warning("Couldn't tidy message %s in #%s", msg.id, ch.name)
 
     async def on_message(self, message: discord.Message):
-        # The board is pinned in #fleet; the "pinned a message" notice is clutter.
-        if (message.type == discord.MessageType.pins_add and message.author == self.user
-                and message.channel.id == self.channels.get(FLEET, message.channel).id):
+        # The bot pins its boards; the "pinned a message" notices are clutter.
+        if message.type == discord.MessageType.pins_add and message.author == self.user:
             await message.delete()
             return
         if message.author.bot or message.guild is None:
