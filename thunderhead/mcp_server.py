@@ -310,7 +310,10 @@ def task_update(task_id: int, status: str = "", owner: str = "", branch: str = "
         if t is None or t["team"] != my_team:
             return f"No task #{task_id} on your team."
         if role == "dev" and t["owner"] != me["name"]:
-            return f"Task #{task_id} isn't yours. Ask your supervisor."
+            if not t["owner"]:
+                return (f"Task #{task_id} has no owner on the board yet; your supervisor may still be assigning "
+                        "it. Check tasks() again in a minute before asking.")
+            return f"Task #{task_id} is {t['owner']}'s, not yours. Ask your supervisor."
         if status and status not in org.TASK_STATUSES:
             return f"status must be one of {', '.join(org.TASK_STATUSES)}."
         if owner and role != "supervisor":
@@ -420,28 +423,47 @@ def propose_charter(text: str, summary: str) -> str:
         return org.propose_charter(conn, me, text, summary)
 
 
-def spawn_dev(name: str, task: str, directory: str = "", model: str = "", effort: str = "") -> str:
+def spawn_dev(name: str, task: str, directory: str = "", model: str = "", effort: str = "",
+              tasks: list[int] | None = None) -> str:
     """Add a tool to your toolbox: a new dev session with its own context, for a kind of work.
 
     Name it for its specialty (billing-api, not dev2). task: what it's for and what to do first; it builds
     its context from this. directory: the product repo it works in, or leave it empty for a fresh
     workspace (never your own folder). model: "haiku", "sonnet" (default) or "opus", up to your team's
     max_model; for complex planning or architecture, ask for opus with request("model", ...). effort:
-    "low" to "max", optional. No approval needed; your team's max_awake limits how many run at once.
+    "low" to "max", optional. tasks: numbers of board tasks to give it; they're assigned before it
+    starts, so it can update them straight away. No approval needed; your team's max_awake limits how
+    many run at once.
     """
+    tasks = list(dict.fromkeys(tasks or []))
     with store.db() as conn:
         me, _, team = _require(conn, "supervisor")
+        rows = [org.get_task(conn, i) for i in tasks]
+        bad = [str(i) for i, t in zip(tasks, rows) if t is None or t["team"] != team]
+        if bad:
+            return f"No task {', '.join('#' + b for b in bad)} on your team's board."
         err, cmd, cwd = org.spawn_dev(conn, team, directory, task, name, model, effort, by=me["name"])
         if err:
             return err
+        # Assign before launching: a new dev is up in seconds and often marks its task 'doing' first
+        # thing, which task_update refuses if the board doesn't say it's the owner yet.
+        before = {t["id"]: t["owner"] for t in rows}
+        for i in tasks:
+            org.update_task(conn, i, owner=name)
+        if tasks:
+            cmd[-1] += (f"\n\nYour tasks on the board: {', '.join(f'#{i}' for i in tasks)}. Update them with "
+                        "task_update() as you go.")
         org.fyi(conn, store.LEAD, f"{me['name']} added '{name}' to team {team} ({model or config.DEFAULT_DEV_MODEL}): "
                                   f"{task[:300]}")
     code, text = launch.run(cmd, cwd=cwd)
     if code != 0:
         with store.db() as conn:
             org.undo_spawn(conn, team, name)
+            for i, owner in before.items():
+                conn.execute("UPDATE tasks SET owner=? WHERE id=?", (owner, i))
         return f"'{name}' didn't start:\n{text}"
-    return f"'{name}' is starting. It'll report back to you with a call when it's done or stuck."
+    given = f" It owns {', '.join(f'#{i}' for i in tasks)} on the board." if tasks else ""
+    return f"'{name}' is starting.{given} It'll report back to you with a call when it's done or stuck."
 
 
 def set_model(dev: str, model: str = "", effort: str = "") -> str:

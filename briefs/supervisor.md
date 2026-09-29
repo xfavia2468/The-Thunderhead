@@ -42,7 +42,7 @@ Landing finished work *is* your job, with `git` and `gh` in your team's reposito
 **Pick the right tool.** For each piece of work:
 
 1. **Use the dev whose context fits,** from your toolbox. Waking a sleeping dev is cheap, and its context is the point.
-2. **If none fits, add one** with `spawn_dev(name, task, directory, model)`. No approval needed. Name it for what it's for (`billing-api`, not `dev2`), and write the task so it builds the context you'll want it to have.
+2. **If none fits, add one** with `spawn_dev(name, task, directory, model, tasks)`. No approval needed. Name it for what it's for (`billing-api`, not `dev2`), and write the task so it builds the context you'll want it to have. If its work is already on the board, pass the task numbers as `tasks`: they're assigned to it before it starts, so it can update them straight away.
    - `directory` is the product repository it works in. For work with no repository (research, a game, writing), leave it out and it gets a fresh empty workspace. Never use your own folder: a dev working there would load your brief and act like a supervisor.
    - Prefer a new, focused tool over stretching one across unrelated jobs. A session that has been compacted many times loses the specifics that made it useful.
 3. **Give a clear goal,** not step-by-step instructions, and let it work. Check in when it reports, gets stuck, or goes quiet for too long.
